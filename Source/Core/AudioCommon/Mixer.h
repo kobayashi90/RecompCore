@@ -112,6 +112,7 @@ private:
 
     DOLPHIN_FORCE_INLINE void PushSample(s16 left, s16 right)
     {
+      m_ever_pushed = true;
       m_next_buffer[m_next_buffer_index] = {left, right};
       m_next_buffer_index = (m_next_buffer_index + 1) & GRANULE_MASK;
 
@@ -138,6 +139,11 @@ private:
     // All non-GBA MixerFifo instances use FIXED_SAMPLE_RATE_DIVIDEND.
     u32 m_input_sample_rate_dividend;
     u32 m_input_sample_rate_divisor;
+    // Set the first time real samples are pushed into this FIFO. MixerFifos
+    // that never receive anything (the Skylander portal and Wiimote speaker
+    // mixers on a GameCube title) are still mixed every output block, so they
+    // starve on every call -- counting those makes the drift report useless.
+    bool m_ever_pushed = false;
 
     Granule m_next_buffer{};
     std::size_t m_next_buffer_index = 0;

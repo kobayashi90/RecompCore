@@ -3,6 +3,7 @@
 
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 #include "Core/System.h"
+#include "VideoCommon/CommandProcessor.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
@@ -57,6 +58,43 @@ void StaticRecompCore::Run()
   auto& memory = m_system.GetMemory();
   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
   FilePtr dispatch_trace = OpenDispatchTrace();
+  m_perf_log = std::getenv("STATICRECOMP_PERF") != nullptr;
+
+  // Every address handed to the module's chunk dispatcher is, by definition, an
+  // entry point into a chunk function's PC switch. DolRecomp cannot prove that
+  // set, so it emits a case for every single guest instruction, which makes the
+  // whole guest register file memory-resident. Recording the addresses the
+  // dispatcher actually sees gives the exact set to prune down to.
+  // STATICRECOMP_ENTRY_LOG=<file> writes one hex address per line at shutdown.
+  constexpr u32 ENTRY_LOG_BASE = 0x80000000u;
+  constexpr u32 ENTRY_LOG_SPAN = 0x00200000u;  // covers the whole DOL text range
+  std::unique_ptr<u8[]> entry_seen;
+  const char* entry_log_path = std::getenv("STATICRECOMP_ENTRY_LOG");
+  const auto dump_entry_log = [&](const char* why) {
+    FilePtr entry_file(std::fopen(entry_log_path, "w"));
+    if (!entry_file)
+    {
+      std::fprintf(stderr, "[staticrecomp] entry log: cannot write %s\n", entry_log_path);
+      return;
+    }
+    u32 entry_count = 0;
+    for (u32 off = 0; off < ENTRY_LOG_SPAN; off += 4)
+    {
+      if (entry_seen[off >> 2])
+      {
+        std::fprintf(entry_file.get(), "%08X\n", ENTRY_LOG_BASE + off);
+        ++entry_count;
+      }
+    }
+    std::fprintf(stderr, "[staticrecomp] entry log (%s): %u addresses\n", why, entry_count);
+  };
+  if (entry_log_path && !*entry_log_path)
+    entry_log_path = nullptr;
+  if (entry_log_path)
+  {
+    entry_seen = std::make_unique<u8[]>(ENTRY_LOG_SPAN >> 2);
+    std::fprintf(stderr, "[staticrecomp] entry log enabled -> %s\n", entry_log_path);
+  }
 
   m_guest.ram = memory.GetRAM();
   m_guest.ram_size = memory.GetRamSizeReal();
@@ -64,6 +102,23 @@ void StaticRecompCore::Run()
   m_guest.exram_size = memory.GetExRamSizeReal();
   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
   const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
+  // Locked-L1 location published for consumers. Informational only:
+  // get_ram_ptr no longer assumes identity placement of the window -- it
+  // asks external_pointer for a per-access host-translated pointer (live
+  // MSR.DR + BAT/TLB) instead of dereferencing this cached location.
+  // Null while lockstep is on.
+  m_guest.l1_cache = lockstep_enabled ? nullptr : memory.GetL1Cache();
+  m_guest.l1_cache_size = lockstep_enabled ? 0u : memory.GetL1CacheSize();
+  // No window until the host has validated a page against the live mapping.
+  m_guest.l1_win_host = nullptr;
+  // Write-gather-pipe staging published for the module's ABI v5 inline fast
+  // path: base is GPFifo's staging buffer (NULL while lockstep is on -- the
+  // hooks own journaling then, and the fast path must not bypass it), cursor
+  // points straight at the host's live byte count so neither side ever has
+  // to republish, and gather_flush drains a full 32-byte block.
+  m_guest.gather_pipe_base = lockstep_enabled ? nullptr : ppc.gather_pipe_base_ptr;
+  m_guest.gather_pipe_cursor = &ppc.gather_pipe_ptr;
+  m_guest.gather_flush = HookGatherFlush;
   const auto fast_dispatchable_at = [this](u32 address) {
     if (m_has_rel_modules || !m_forced_fallback_ranges.empty())
       return FastDispatchableAt(address);
@@ -120,15 +175,66 @@ void StaticRecompCore::Run()
   while (*state_ptr == CPU::State::Running)
   {
     core_timing.Advance();
-    const std::string current_game_id = SConfig::GetInstance().GetGameID();
-    m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
+
+    if (m_perf_log)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - m_perf_last >= std::chrono::milliseconds(1000))
+      {
+        if (m_perf_secs == 0)
+          m_perf_last = now;  // first tick only arms the clock
+        const u64 cur[PERF_FIELDS] = {m_bursts,        m_charged_cycles, m_native_dispatches,
+                                      m_hook_ptr_calls, m_hook_ptr_l1,   m_hook_ptr_ram,
+                                      m_hook_ptr_null, m_hook_mmio_gather, m_hook_mmio_other,
+                                      m_hook_fallback_instructions, m_spr_reads, m_pub_calls,
+                                      m_pub_ok,       m_win_null,       m_win_page,
+                                      m_win_msr,      m_msr_xor,        m_fb_calls,
+                                      m_system.GetCommandProcessor().GetGatherPipeBurstCount()};
+        std::fprintf(stderr,
+                     "[perf] t=%llu bursts=%llu cycles=%llu dispatch=%llu ptr=%llu(l1=%llu "
+                     "ram=%llu null=%llu) mmio=%llu/%llu fb=%llu spr=%llu pub=%llu/%llu "
+                     "winmiss=%llu/%llu/%llu msr=%08x/%08x xor=%016llx fbhook=%llu gather=%llu\n",
+                     static_cast<unsigned long long>(++m_perf_secs),
+                     static_cast<unsigned long long>(cur[0] - m_perf_prev[0]),
+                     static_cast<unsigned long long>(cur[1] - m_perf_prev[1]),
+                     static_cast<unsigned long long>(cur[2] - m_perf_prev[2]),
+                     static_cast<unsigned long long>(cur[3] - m_perf_prev[3]),
+                     static_cast<unsigned long long>(cur[4] - m_perf_prev[4]),
+                     static_cast<unsigned long long>(cur[5] - m_perf_prev[5]),
+                     static_cast<unsigned long long>(cur[6] - m_perf_prev[6]),
+                     static_cast<unsigned long long>(cur[7] - m_perf_prev[7]),
+                     static_cast<unsigned long long>(cur[8] - m_perf_prev[8]),
+                     static_cast<unsigned long long>(cur[9] - m_perf_prev[9]),
+                     static_cast<unsigned long long>(cur[10] - m_perf_prev[10]),
+                     static_cast<unsigned long long>(cur[11] - m_perf_prev[11]),
+                     static_cast<unsigned long long>(cur[12] - m_perf_prev[12]),
+                     static_cast<unsigned long long>(cur[13] - m_perf_prev[13]),
+                     static_cast<unsigned long long>(cur[14] - m_perf_prev[14]),
+                     static_cast<unsigned long long>(cur[15] - m_perf_prev[15]),
+                     (unsigned)m_msr_pub, (unsigned)m_msr_live,
+                     (unsigned long long)m_msr_xor,
+                     static_cast<unsigned long long>(cur[17] - m_perf_prev[17]),
+                     static_cast<unsigned long long>(cur[18] - m_perf_prev[18]));
+        std::fflush(stderr);
+        for (std::size_t i = 0; i < PERF_FIELDS; ++i)
+          m_perf_prev[i] = cur[i];
+        m_perf_last = now;
+      }
+    }
+
+    // Mods can only intercept guest code when they actually installed a hook,
+    // patch or pending return, yet host_call_contains is always wired. Probe
+    // that once per burst instead of 2-4 unordered_map lookups per dispatch.
+    const bool mod_interception =
+        m_module_source.host_call_active == nullptr ||
+        m_module_source.host_call_active(m_module_source.host_call_user);
 
     do
     {
       // MSR.FP needs no gate here: generated FPU instructions raise the
       // FP-unavailable exception themselves (ppc_fp_available).
       if (m_module_active && DispatchableAt(ppc.pc) &&
-          !(m_guest.host_call && IsHostCallAddress(ppc.pc)))
+          !(mod_interception && m_guest.host_call && IsHostCallAddress(ppc.pc)))
       {
         SyncIn();
         ++m_bursts;
@@ -155,6 +261,16 @@ void StaticRecompCore::Run()
           if (m_has_rel_modules)
             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
           m_guest.pc = linked_dispatch_address;
+          if (entry_seen)
+          {
+            const u32 entry_off = linked_dispatch_address - ENTRY_LOG_BASE;
+            if (entry_off < ENTRY_LOG_SPAN)
+              entry_seen[entry_off >> 2] = 1;
+            // The in-app panic modal blocks clean shutdown, so flush the set
+            // periodically rather than only on the way out.
+            if ((m_native_dispatches & 0x3FFFFFu) == 0)
+              dump_entry_log("periodic");
+          }
           m_module->dispatch(&m_guest, linked_dispatch_address);
           if (m_has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
@@ -174,6 +290,12 @@ void StaticRecompCore::Run()
           // external-interrupt latency matches stock.
           const s64 charge = -m_guest.downcount;
           m_guest.downcount = 0;
+          if (charge <= 0)
+          {
+            ++m_stall_dispatches;
+            if (m_stall_pcs.size() < 4096)
+              ++m_stall_pcs[m_guest.pc];
+          }
           const u64 effective_charge = static_cast<u64>(charge > 0 ? charge : 1);
           ppc.downcount -= static_cast<int>(effective_charge);
           m_charged_cycles += effective_charge;
@@ -181,10 +303,18 @@ void StaticRecompCore::Run()
           m_guest.timebase += total_cycles / SystemTimers::TIMER_RATIO;
           m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
 
-          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread).
+          // A spinning loop returns here with the same pc every time, so the
+          // one-entry cache answers the common hit; the bloom rejects the rest
+          // without touching the list.
+          if (m_guest.pc == m_idle_pc_cached ||
+              ((m_idle_pc_bloom >> ((m_guest.pc >> 2) & 63)) & 1u) != 0)
           {
-            m_system.GetCoreTiming().Idle();
+            if (IsIdlePc(m_guest.pc))
+            {
+              m_idle_pc_cached = m_guest.pc;
+              m_system.GetCoreTiming().Idle();
+            }
           }
 
           // ctx->timebase is refreshed at burst start (SyncIn), and here we
@@ -204,7 +334,8 @@ void StaticRecompCore::Run()
               (m_guest.msr & 0x8000u) != 0 && after_mtmsr(m_guest.pc))
             break;
         } while (m_module_active && fast_dispatchable_at(m_guest.pc) &&
-                 !(m_guest.host_call && IsHostCallAddress(m_guest.pc)) && ppc.downcount > 0 &&
+                 !(mod_interception && m_guest.host_call && IsHostCallAddress(m_guest.pc)) &&
+                 ppc.downcount > 0 &&
                  *state_ptr == CPU::State::Running);
         SyncOut();
         if ((ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0)
@@ -264,6 +395,9 @@ void StaticRecompCore::Run()
       }
     } while (ppc.downcount > 0 && *state_ptr == CPU::State::Running);
   }
+
+  if (entry_seen)
+    dump_entry_log("shutdown");
 }
 
 void StaticRecompCore::SingleStep()

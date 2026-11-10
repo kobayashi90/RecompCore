@@ -153,6 +153,10 @@ bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_ad
 
 u32 StaticRecompCore::TranslateRelAddress(u32 linked_address)
 {
+  // Most builds have no rel modules at all; skip the section scan entirely
+  // rather than walking an empty vector on every hardware access.
+  if (!m_has_rel_modules)
+    return linked_address;
   u32 runtime_address = linked_address;
   ResolveRuntimeAddress(linked_address, &runtime_address);
   return runtime_address;
@@ -178,11 +182,20 @@ void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
   if (!m_module)
   {
     m_chunk_lookup_table.clear();
+    m_code_line_bits.clear();
+    m_code_line_count = 0;
     return;
   }
 
   u32 total_instructions = (ram_size + exram_size) >> 2;
   m_chunk_lookup_table.assign(total_instructions, -1);
+
+  // Same address space, 32-byte granularity: one bit per instruction-cache
+  // line that any chunk overlaps. See CacheOpTouchesCode.
+  m_code_line_count = total_instructions >> 3;
+  m_code_line_bits.assign((static_cast<size_t>(m_code_line_count) + 63) / 64, 0);
+  m_cacheop_probes = 0;
+  m_cacheop_skipped = 0;
 
   for (u32 i = 0; i < m_module->num_chunk_ranges; ++i)
   {
@@ -196,8 +209,34 @@ void StaticRecompCore::InitLookupTable(u32 ram_size, u32 exram_size)
       {
         m_chunk_lookup_table[idx] = static_cast<int>(i);
       }
+
+      // First line is aligned down because a chunk boundary need not be.
+      const u32 first_line = static_cast<u32>(start_idx) >> 3;
+      const u32 last_line =
+          static_cast<u32>(end_idx > 0 ? end_idx - 1 : 0) >> 3;
+      for (u32 line = first_line; line <= last_line && line < m_code_line_count; ++line)
+        m_code_line_bits[line >> 6] |= u64{1} << (line & 63);
     }
   }
+}
+
+bool StaticRecompCore::CacheOpTouchesCode(u32 ea) const
+{
+  // A relocation module remaps guest addresses at runtime, so this table (built
+  // from the module's linked addresses) would answer about the wrong line. No
+  // rel modules is the normal case for a static recompilation; when there are
+  // any, pay for the full path.
+  if (!m_module || m_has_rel_modules || m_code_line_bits.empty())
+    return true;
+
+  const int idx = GetAddressLookupIndex(ea & ~31u);
+  if (idx < 0)
+    return true;  // not RAM/EXRAM at all: let the slow path decide
+
+  const u32 line = static_cast<u32>(idx) >> 3;
+  if (line >= m_code_line_count)
+    return true;
+  return (m_code_line_bits[line >> 6] >> (line & 63)) & 1u;
 }
 
 int StaticRecompCore::ChunkIndexOf(u32 address)
@@ -332,7 +371,13 @@ void StaticRecompCore::VerifyChunk(u32 index)
 
 void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
 {
-  if (m_fallback_jit)
+  // The fallback block cache is empty under static recompilation: the guest
+  // runs from the module, and JitInterface::CompileExceptionCheck is gated the
+  // same way. InvalidateICache still walks its range lists and erases from the
+  // phys->block hash maps for every icbi, so skip it when there is nothing to
+  // erase. (It showed up as JitBaseBlockCache::InvalidateICache +
+  // InvalidateICacheInternal in the CPU-thread profile.)
+  if (m_fallback_jit && m_fallback_jit->GetBlockCache()->GetBlockCount() != 0)
   {
     m_fallback_jit->GetBlockCache()->InvalidateICache(address, length, false);
   }

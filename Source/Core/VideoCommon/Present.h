@@ -12,6 +12,7 @@
 #include "VideoCommon/VideoCommon.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <tuple>
@@ -92,7 +93,12 @@ public:
   // Final surface changing
   // This is called when the surface is resized (WX) or the window changes (Android).
   void ChangeSurface(void* new_surface_handle);
-  void ResizeSurface();
+  void ResizeSurface(int width = 0, int height = 0);
+  // Pops the size pushed by ResizeSurface (0x0 when none pending). On Wayland
+  // the surface capabilities report the extent of the LAST ATTACHED BUFFER
+  // (stale by one configure), so the swap chain must take the size the
+  // compositor actually configured instead of querying the surface.
+  void TakeRequestedSurfaceSize(int& width, int& height);
   bool SurfaceResizedTestAndClear() { return m_surface_resized.TestAndClear(); }
   bool SurfaceChangedTestAndClear() { return m_surface_changed.TestAndClear(); }
   void* GetNewSurfaceHandle();
@@ -102,6 +108,31 @@ public:
   void SetKey(u32 key, bool is_down, const char* chars);
   void SetMousePos(float x, float y);
   void SetMousePress(u32 button_mask);
+  // Forwards to OnScreenUI's raw input feeds (used by the F1 settings menu,
+  // which draws inside the game window through the OSD ImGui context).
+  void SetKeysym(u32 keysym, bool is_down);
+  void SetMouseWheel(float x, float y);
+
+  // Presents one overlay frame while emulation is paused (no ViSwap feeds
+  // frames then): black XFB + OSD + the overlay hook's menu, paced by the
+  // caller. Serializes against Presenter teardown via s_forced_present_mutex.
+  static void PresentOverlayFrame();
+
+  // Runs fn with the live presenter, or skips it if the presenter is gone.
+  // Serializes against the Presenter destructor (which holds the same lock
+  // for its whole body), so call sites that fetched g_presenter from a
+  // queued/async context — Video_OutputXFB's AsyncRequests ViSwap event,
+  // BPStructs' ImmediateSwap — can't race g_presenter.reset() during
+  // shutdown (that was a use-after-free in PostProcessing::BlitFromTexture).
+  static void WithPresenter(const std::function<void(Presenter&)>& fn);
+
+  // Destroys g_presenter. The unique_ptr must not be reset directly during
+  // shutdown: reset() nulls the pointer BEFORE running the destructor, so an
+  // in-flight Present (e.g. the settings menu's forced present) would read a
+  // nulled g_presenter mid-call (PostProcessing::BlitFromTexture ->
+  // GetTargetRectangle). Nulling under s_forced_present_mutex keeps every
+  // lock-holding reader consistent: they finish before the pointer goes.
+  static void Shutdown();
 
   int FrameCount() const { return m_frame_count; }
 
@@ -110,6 +141,11 @@ public:
   const MathUtil::Rectangle<int>& GetTargetRectangle() const { return m_target_rectangle; }
 
 private:
+  // True when a forced overlay present can actually run: graphics backend up
+  // and not headless, OSD (and therefore its overlay hook) initialized, and
+  // a real backbuffer format bound.
+  bool OverlayPresentReady() const;
+
   // Fetches the XFB texture from the texture cache.
   // Returns true the contents have changed since last time
   bool FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks);
@@ -133,6 +169,19 @@ private:
   ConvertStereoRectangle(const MathUtil::Rectangle<int>& rc) const;
 
   std::mutex m_swap_mutex;
+  // Size the platform layer configured for the surface; consumed by the
+  // graphics backend when it recreates the swap chain (guarded by
+  // m_swap_mutex, together with m_surface_resized).
+  int m_requested_surface_width = 0;
+  int m_requested_surface_height = 0;
+  // Serializes Present() against the menu thread's forced presents
+  // (PresentOverlayFrame). Lock order: s_forced_present_mutex ->
+  // m_present_mutex -> OnScreenUI::m_imgui_mutex; never the reverse.
+  std::mutex m_present_mutex;
+  // Held across g_presenter use in PresentOverlayFrame and the whole
+  // Presenter destructor, so a forced present can never touch a Presenter
+  // that is being destroyed (unique_ptr::reset nulls the pointer first).
+  static std::mutex s_forced_present_mutex;
 
   // Backbuffer (window) size and render area
   int m_backbuffer_width = 0;

@@ -3,7 +3,12 @@
 
 #include "VideoCommon/BPStructs.h"
 
+
+
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -40,6 +45,15 @@
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 #include "VideoCommon/XFStateManager.h"
+
+// MODERNGEKKO diagnostic: which XFB copy last filled each address. A present can
+// then report the age of the picture it is about to put on screen, in copies.
+// If the display were fed in copy order every present would be age 0; an
+// alternating 0/1/2 pattern is the signature of a double-buffered XFB whose
+// two halves are shown in the wrong order, which is exactly what 25 Hz flicker
+// looks like when a 50 Hz source is presented one frame out.
+u64 g_mg_xfb_copy_total = 0;
+u64 g_mg_xfb_copy_seq_at[4096] = {};
 
 using namespace BPFunctions;
 
@@ -336,6 +350,57 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
                       bpmem.copyTexSrcWH.x + 1, destStride, height, yScale);
 
         bool is_depth_copy = bpmem.zcontrol.pixel_format == PixelFormat::Z24;
+
+        // MODERNGEKKO_XFB_COPY_DEBUG=1 reports, once per second, how the game
+        // fills the XFB: how many copies it issues and how many lines each one
+        // covers. This decides whether stitching two fields is even correct.
+        // One 264-line copy per field means the two halves of the stitched
+        // picture are different points in time, so a weave combs on motion. A
+        // single 528-line copy means one swap already carries a whole frame and
+        // the weave is exact.
+        {
+          static const bool xfb_copy_debug = [] {
+            const char* value = std::getenv("MODERNGEKKO_XFB_COPY_DEBUG");
+            return value && *value == '1';
+          }();
+          if (xfb_copy_debug)
+          {
+            static u32 copies = 0;
+            static u32 lines_total = 0;
+            static u32 last_height = 0;
+            static u32 last_dest = 0;
+            static u32 last_stride = 0;
+            static u32 last_top = 0;
+            static auto window_start = std::chrono::steady_clock::now();
+            copies++;
+            lines_total += height;
+            last_height = height;
+            last_dest = destAddr;
+            last_stride = destStride;
+            last_top = srcRect.top;
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - window_start);
+            if (elapsed.count() >= 1000)
+            {
+              std::fprintf(stderr,
+                           "[xfbcopy] copies/s=%u lines_total=%u last_h=%u dest=%08x "
+                           "stride=%u src_top=%u src_h=%u yscale=%.3f\n",
+                           copies, lines_total, last_height, last_dest, last_stride, last_top,
+                           srcRect.GetHeight(), yScale);
+              std::fflush(stderr);
+              copies = 0;
+              lines_total = 0;
+              window_start = now;
+            }
+          }
+        }
+
+        {
+          const u64 seq = ++g_mg_xfb_copy_total;
+          g_mg_xfb_copy_seq_at[(destAddr >> 6) & 4095] = seq;
+        }
+
         g_texture_cache->CopyRenderTargetToTexture(
             destAddr, EFBCopyFormat::XFB, copy_width, height, destStride, is_depth_copy, srcRect,
             false, false, yScale, s_gammaLUT[PE_copy.gamma], bpmem.triggerEFBCopy.clamp_top,
@@ -361,7 +426,11 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
         if (g_ActiveConfig.bImmediateXFB)
         {
           // below div two to convert from bytes to pixels - it expects width, not stride
-          g_presenter->ImmediateSwap(destAddr, destStride / 2, destStride, height);
+          // WithPresenter: runs on the emulation thread, may race presenter
+          // teardown during shutdown.
+          VideoCommon::Presenter::WithPresenter([&](VideoCommon::Presenter& presenter) {
+            presenter.ImmediateSwap(destAddr, destStride / 2, destStride, height);
+          });
         }
         else
         {

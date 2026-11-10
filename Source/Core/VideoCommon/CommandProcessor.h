@@ -171,7 +171,33 @@ public:
 
   void SetCPStatusFromGPU();
   void SetCPStatusFromCPU();
-  void GatherPipeBursted();
+  bool ComputeFifoInterrupt();
+  void GatherPipeBursted(u32 blocks = 1);
+  // Publish every 32-byte gather-pipe block that GPFifo has already copied into
+  // the ring but the CPU thread has not yet accounted for. Every drain point
+  // (any guest MMIO access, a CP status read, a FIFO reset) must call this so
+  // the GPU thread and the guest never observe a FIFO that is behind the pipe.
+  void FlushPendingGatherPipe();
+
+  // Diagnostic: how many gather-pipe bursts this session has processed. Each
+  // one costs a cross-thread handshake with the GPU thread, so this is the rate
+  // that governs how much of the CPU thread the FIFO protocol itself burns.
+  u64 GetGatherPipeBurstCount() const { return m_gather_bursts; }
+
+  u16 GetCtrlHexSeen() const { return m_ctrl_hex_seen; }
+  void GetFifoDiag(u32* hi_wm, u32* lo_wm, u32* hi_int, u32* lo_int, u32* size,
+                   u32* max_dist, u32* max_bp) const
+  {
+    *hi_wm = m_fifo.CPHiWatermark;
+    *lo_wm = m_fifo.CPLoWatermark;
+    *hi_int = m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
+    *lo_int = m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
+    *size = m_fifo.CPEnd.load(std::memory_order_relaxed) -
+            m_fifo.CPBase.load(std::memory_order_relaxed);
+    *max_dist = m_max_distance_seen;
+    *max_bp = m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
+  }
+  bool FifoInterruptPossible() const { return m_fifo_interrupts_possible; }
   void UpdateInterrupts(u64 userdata);
   void UpdateInterruptsFromVideoBackend(u64 userdata);
 
@@ -204,6 +230,31 @@ private:
   Common::Flag m_interrupt_waiting;
 
   bool m_is_fifo_error_seen = false;
+
+  // True when the game has ever enabled a FIFO breakpoint/overflow/underflow
+  // interrupt. Those are the only inputs that can make the CP status handlers
+  // raise an interrupt, so when all three are clear the whole overflow
+  // computation (six atomic loads plus two stores into the cache line the GPU
+  // thread is hammering) is dead work on every single gather-pipe burst.
+  bool m_fifo_interrupts_possible = false;
+  // A/B switch for the early return above (STATICRECOMP_FIFO_GATE=0 restores the
+  // unconditional status recomputation) so the win can be measured against the
+  // same binary under a moving ambient load.
+  bool m_fifo_status_gate = true;
+  u16 m_ctrl_hex_seen = 0;
+  u32 m_max_distance_seen = 0;
+  void RefreshFifoInterruptFlag();
+
+  u64 m_gather_bursts = 0;
+  // Gather-pipe publishes are coalesced: GPFifo copies each 32-byte block into
+  // the ring immediately (so the guest-visible byte granularity is unchanged),
+  // but the shared FIFO bookkeeping -- the two locked read-modify-writes on the
+  // cache line the video thread is reading, the interrupt recomputation and the
+  // GPU-thread wakeup -- is done once per m_gather_batch blocks instead of once
+  // per block. At ~1 M blocks/s that bookkeeping was the single largest host
+  // cost on the CPU thread. Drain points bound the delay.
+  u32 m_pending_gather_blocks = 0;
+  u32 m_gather_batch = 32;
 
   Core::System& m_system;
 };

@@ -322,6 +322,14 @@ void JitInterface::CompileExceptionCheck(ExceptionType type)
   if (!m_jit)
     return;
 
+  // This only exists to recompile a JIT block so the check is folded into it.
+  // Under static recompilation guest code runs from the module, so with an
+  // empty fallback block cache there is nothing to invalidate -- and this is
+  // called on every gather-pipe burst, which is far too often to spend an
+  // unordered_set probe (plus a PPC state fetch) on a no-op.
+  if (m_jit->GetBlockCache()->GetBlockCount() == 0)
+    return;
+
   // Register against the core that compiled the block this fired from. Under
   // static recompilation that is the fallback JIT rather than the static core:
   // the fallback is what reads these sets when it compiles, and what retires

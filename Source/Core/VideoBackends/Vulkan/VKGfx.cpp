@@ -5,7 +5,12 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
@@ -25,6 +30,11 @@
 #include "VideoCommon/Present.h"
 #include "VideoCommon/RenderState.h"
 #include "VideoCommon/VideoConfig.h"
+
+// MODERNGEKKO diagnostic, defined in VideoCommon/BPStructs.cpp and Present.cpp.
+extern u32 g_mg_last_present_addr;
+extern u64 g_mg_xfb_copy_total;
+extern u64 g_mg_xfb_copy_seq_at[4096];
 
 namespace Vulkan
 {
@@ -311,6 +321,105 @@ void VKGfx::PresentBackbuffer()
   // End drawing to backbuffer
   StateTracker::GetInstance()->EndRenderPass();
 
+  // MODERNGEKKO_SWAP_DUMP=<dir> reads the finished backbuffer back to the CPU,
+  // once per present, before it is handed to the compositor. This is the only
+  // honest source of "what the player actually sees": the XFB texture is
+  // GPU-resident, guest RAM at the XFB address is never written, and the
+  // automation screenshot path races the frame it is asked about.
+  //
+  // The copy has to be recorded into the frame's own command buffer and only
+  // waited on after present: submitting it separately deadlocks, because the
+  // swapchain image the copy reads is not safe to use until the acquisition
+  // semaphore has been waited on, and that wait lives in the present submission.
+  //
+  // MODERNGEKKO_SWAP_DUMP_SKIP=n / MODERNGEKKO_SWAP_DUMP_MAX=m bound the burst.
+  // One line per dump: index, size, FNV hash of the luma plane, mean, and the
+  // vertical-neighbour disagreement score (comb detector) on that luma plane.
+  AbstractStagingTexture* swap_dump_staging = nullptr;
+  TextureConfig swap_dump_config = {};
+  if (std::getenv("MODERNGEKKO_SWAP_DUMP") && m_swap_chain->IsCurrentImageValid())
+  {
+    static const char* const dump_dir = std::getenv("MODERNGEKKO_SWAP_DUMP");
+    static const int dump_skip = [] {
+      const char* const value = std::getenv("MODERNGEKKO_SWAP_DUMP_SKIP");
+      return value ? std::atoi(value) : 0;
+    }();
+    static const int dump_max = [] {
+      const char* const value = std::getenv("MODERNGEKKO_SWAP_DUMP_MAX");
+      return value ? std::atoi(value) : 0;
+    }();
+    static const int dump_stride = [] {
+      const char* const value = std::getenv("MODERNGEKKO_SWAP_DUMP_STRIDE");
+      const int stride = value ? std::atoi(value) : 1;
+      return stride > 0 ? stride : 1;
+    }();
+    // Deliberately leaked: a static unique_ptr would be destroyed after the
+    // Vulkan context, which is a crash at shutdown.
+    static AbstractStagingTexture* staging = nullptr;
+    static u32 staging_width = 0;
+    static u32 staging_height = 0;
+    static u64 present_index = 0;
+
+    VKTexture* const backbuffer = m_swap_chain->GetCurrentTexture();
+    const TextureConfig config = backbuffer->GetConfig();
+    if (!staging || staging_width != config.width || staging_height != config.height)
+    {
+      staging = CreateStagingTexture(StagingTextureType::Readback, config).release();
+      staging_width = config.width;
+      staging_height = config.height;
+      std::fprintf(stderr, "[swapdump] staging %ux%u fmt=%u ok=%d dir=%s\n", config.width,
+                   config.height, static_cast<unsigned>(config.format), staging ? 1 : 0,
+                   dump_dir);
+      std::fflush(stderr);
+    }
+
+    const u64 index = present_index++;
+    if ((index % 100) == 0)
+    {
+      std::fprintf(stderr, "[swapdump] present=%llu\n",
+                   static_cast<unsigned long long>(index));
+      std::fflush(stderr);
+    }
+    // MODERNGEKKO_SWAP_DUMP_GATE=<path> bounds the dump by a sentinel file
+    // instead of by present counts: frames are captured only while that file
+    // exists. Present counting cannot be used to aim at an interesting moment
+    // from outside the process -- the settings overlay pauses emulation and
+    // drives its own presents from another thread, so the count at the moment
+    // F1 is pressed depends on how fast the game happens to be running. A file
+    // the harness creates and removes is exact, needs no restart, and makes the
+    // capture window independent of timing.
+    const bool gate_open = [] {
+      const char* const gate = std::getenv("MODERNGEKKO_SWAP_DUMP_GATE");
+      if (!gate || !*gate)
+        return true;
+      std::error_code gate_error;
+      return std::filesystem::exists(gate, gate_error);
+    }();
+    // The burst counts only the presents that happen while the gate is open, and
+    // restarts at zero every time it closes. Counting from process start instead
+    // would let the first capture exhaust SKIP/MAX for the whole session, so a
+    // harness could only ever aim once -- exactly the problem the gate exists to
+    // solve, just moved one level down.
+    static u64 burst_index = 0;
+    if (!gate_open)
+      burst_index = 0;
+    const u64 burst = gate_open ? burst_index++ : 0;
+    const bool wanted = staging && gate_open && burst >= static_cast<u64>(dump_skip) &&
+                        (dump_max == 0 || burst < static_cast<u64>(dump_skip + dump_max)) &&
+                        (burst % static_cast<u64>(dump_stride)) == 0;
+    if (wanted)
+    {
+      const MathUtil::Rectangle<int> rect(0, 0, config.width, config.height);
+      staging->CopyFromTexture(backbuffer, rect, 0, 0, rect);
+      swap_dump_staging = staging;
+      swap_dump_config = config;
+      std::fprintf(stderr, "[swapdump] pending i=%llu b=%llu\n",
+                   static_cast<unsigned long long>(index),
+                   static_cast<unsigned long long>(burst));
+      std::fflush(stderr);
+    }
+  }
+
   if (m_swap_chain->IsCurrentImageValid())
   {
     // Transition the backbuffer to PRESENT_SRC to ensure all commands drawing
@@ -328,6 +437,107 @@ void VKGfx::PresentBackbuffer()
   else
   {
     g_command_buffer_mgr->SubmitCommandBuffer(true, false, true);
+  }
+
+  if (swap_dump_staging)
+  {
+    swap_dump_staging->Flush();
+    const u8* const src = reinterpret_cast<const u8*>(swap_dump_staging->GetMappedPointer());
+    const size_t stride = swap_dump_staging->GetMappedStride();
+    const u32 texel = static_cast<u32>(swap_dump_staging->GetTexelSize());
+    const u32 width = swap_dump_config.width;
+    const u32 height = swap_dump_config.height;
+    std::vector<u8> luma(static_cast<size_t>(width) * height);
+    u64 hash = 0xcbf29ce484222325ULL;
+    u64 sum = 0;
+    u64 vertical_delta = 0;
+    u64 vertical_pairs = 0;
+    for (u32 y = 0; y < height; ++y)
+    {
+      const u8* const row = src + y * stride;
+      u8* const out = luma.data() + static_cast<size_t>(y) * width;
+      for (u32 x = 0; x < width; ++x)
+      {
+        // The swapchain is not always 8-bit: this build's is RGB10_A2 (fmt=2),
+        // where the channels are packed 10 bits each and reading a single byte
+        // samples the boundary between two of them -- which produced a plane
+        // whose *structure* was right (edges still landed in the right place)
+        // but whose "brightness" was meaningless. Handle the packed format
+        // explicitly and fall back to the green byte for the 8-bit ones (green
+        // is channel 1 for both BGRA8 and RGBA8).
+        u8 value;
+        if (swap_dump_config.format == AbstractTextureFormat::RGB10_A2)
+        {
+          u32 packed;
+          std::memcpy(&packed, row + x * texel, sizeof(packed));
+          value = static_cast<u8>(((packed >> 10) & 0x3FF) >> 2);
+        }
+        else
+        {
+          value = row[x * texel + 1];
+        }
+        out[x] = value;
+        hash = (hash ^ value) * 0x100000001b3ULL;
+        sum += value;
+        if (y > 0)
+        {
+          const u8 above = luma[static_cast<size_t>(y - 1) * width + x];
+          vertical_delta += static_cast<u64>(value > above ? value - above : above - value);
+          ++vertical_pairs;
+        }
+      }
+    }
+    static u64 dump_index = 0;
+    const u32 present_addr = g_mg_last_present_addr;
+    const u64 present_copy =
+        present_addr ? g_mg_xfb_copy_seq_at[(present_addr >> 6) & 4095] : 0;
+    std::fprintf(stderr,
+                 "[swapdump] i=%llu %ux%u hash=%016llx mean=%.2f vdiff=%.3f addr=%08x "
+                 "copy=%llu total=%llu\n",
+                 static_cast<unsigned long long>(dump_index++), width, height,
+                 static_cast<unsigned long long>(hash),
+                 static_cast<double>(sum) / (width * height),
+                 static_cast<double>(vertical_delta) / static_cast<double>(vertical_pairs),
+                 present_addr, static_cast<unsigned long long>(present_copy),
+                 static_cast<unsigned long long>(g_mg_xfb_copy_total));
+    std::fflush(stderr);
+    // Only write the frames that actually differ from the previous present, so
+    // a multi-second static screen does not fill the disk with copies. What is
+    // left is the sequence of *unique* pictures the display was shown, which is
+    // exactly the sequence flicker has to be explained from.
+    static u64 last_written_hash = 0;
+    static bool wrote_any = false;
+    static const char* const out_dir = std::getenv("MODERNGEKKO_SWAP_DUMP_FILES");
+    // When the gate is open the harness wants exactly one frame per
+    // opening, even if the picture is byte-identical to the last one (the
+    // settings menu is a frozen frame, so its hash never changes). Without
+    // this bypass the second capture() never produces a new file and the
+    // harness reports "no rect was ever submitted" for every tab.
+    const char* const gate_env = std::getenv("MODERNGEKKO_SWAP_DUMP_GATE");
+    const bool harness_mode = gate_env && *gate_env;
+    const bool gate_open_now = !harness_mode || [&] {
+      std::error_code gate_error;
+      return std::filesystem::exists(gate_env, gate_error);
+    }();
+    // Only bypass the hash de-duplication when a gate is explicitly in use
+    // (harness mode): the menu is a frozen frame, so its hash never changes
+    // and the second capture() would otherwise never produce a new file.
+    if (out_dir && (harness_mode && gate_open_now || !wrote_any || hash != last_written_hash))
+    {
+      static u64 file_index = 0;
+      char path[512];
+      std::snprintf(path, sizeof(path), "%s/swap-%05llu.pgm", out_dir,
+                    static_cast<unsigned long long>(file_index++));
+      if (FILE* const file = std::fopen(path, "wb"))
+      {
+        std::fprintf(file, "P5\n%u %u\n255\n", width, height);
+        std::fwrite(luma.data(), 1, luma.size(), file);
+        std::fclose(file);
+        last_written_hash = hash;
+        wrote_any = true;
+      }
+    }
+    swap_dump_staging->Unmap();
   }
 
   // New cmdbuffer, so invalidate state.
@@ -379,6 +589,8 @@ void VKGfx::CheckForSurfaceResize()
 {
   if (!g_presenter->SurfaceResizedTestAndClear())
     return;
+
+  std::fprintf(stderr, "[vk] surface resize consumed, recreating swap chain\n");
 
   // If we don't have a surface, how can we resize the swap chain?
   // CheckForSurfaceChange should handle this case.

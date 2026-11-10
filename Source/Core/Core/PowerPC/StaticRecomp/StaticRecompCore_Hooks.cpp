@@ -9,10 +9,14 @@
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/HW/GPFifo.h"
+#include "VideoCommon/CommandProcessor.h"
 #include "Core/HW/SystemTimers.h"
 #include "Common/Logging/Log.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <string>
 
 namespace
 {
@@ -32,9 +36,14 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
   ea = core->TranslateRelAddress(ea);
   if (ea == 0)
     std::fprintf(stderr, "[zero-access] read size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
-                 cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
+                 cpu->pc, core->m_ppc->pc, cpu->lr);
+  // Publish the gather-pipe blocks the CPU has staged but not accounted for
+  // before touching hardware: MMIO is the guest's only way to observe (or
+  // depend on) FIFO state, and it runs a few thousand times a second, so the
+  // drain is free. This is the same trigger Dolphin's JITs use.
+  core->m_cp->FlushPendingGatherPipe();
   core->PropagateGuestMSR();
-  auto& mmu = core->m_system.GetMMU();
+  auto& mmu = *core->m_mmu;
   u64 value;
   switch (size)
   {
@@ -65,10 +74,8 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 size)
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+
   ea = core->TranslateRelAddress(ea);
-  if (ea == 0)
-    std::fprintf(stderr, "[zero-access] write size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
-                 cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
 
   // Gather-pipe fast path: stores to the write-gather pipe page at effective
   // 0xCC008000 go straight to GPFifo, mirroring the MMU's masked-write
@@ -77,9 +84,10 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
   // maintains ppc_state.gather_pipe_ptr internally.
   if ((ea & 0xFFFFF000) == 0xCC008000u)
   {
+    ++core->m_hook_mmio_gather;
     if (core->m_lockstep_verifier->m_ls_journaling)
       core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
-    auto& gpfifo = core->m_system.GetGPFifo();
+    auto& gpfifo = *core->m_gpfifo;
     switch (size)
     {
     case 1:
@@ -101,8 +109,11 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
     }
   }
 
+  ++core->m_hook_mmio_other;
+  // Non-gather MMIO write: publish pending pipe blocks first (see HookExternalRead).
+  core->m_cp->FlushPendingGatherPipe();
   core->PropagateGuestMSR();
-  auto& mmu = core->m_system.GetMMU();
+  auto& mmu = *core->m_mmu;
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
   {
@@ -128,6 +139,16 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
   }
 }
 
+void StaticRecompCore::HookGatherFlush(CPUState* cpu)
+{
+  // ABI v5: the module has staged a full 32-byte gather-pipe block, writing
+  // through PPCState.gather_pipe_ptr (its cursor points straight at that
+  // field), so all the host has to run is GPFifo's normal drain -- the same
+  // tail GPFifoManager::Write32 performs after every store, minus the store.
+  auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  core->m_gpfifo->CheckGatherPipe();
+}
+
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
 {
   // eciwx external-control read. EAR-enable and alignment were checked by the
@@ -135,8 +156,9 @@ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
   // MMU read (the rid is carried in EAR only).
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
+  core->m_cp->FlushPendingGatherPipe();
   core->PropagateGuestMSR();
-  auto& mmu = core->m_system.GetMMU();
+  auto& mmu = *core->m_mmu;
   const u32 value = mmu.Read<u32>(ea);
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
@@ -151,8 +173,9 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 
   // ecowx external-control write; see HookExternalRead32.
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
+  core->m_cp->FlushPendingGatherPipe();
   core->PropagateGuestMSR();
-  auto& mmu = core->m_system.GetMMU();
+  auto& mmu = *core->m_mmu;
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
   {
@@ -161,27 +184,138 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 
   mmu.Write<u32>(value, ea);
 }
 
+// Prove that one page of the segment-0xE window is identity translated, then
+// let the module serve it inline. Called from the host fallback, i.e. only after
+// the page already translated successfully once, so the endpoint lookups cost
+// nothing measurable (one page, once). Exactness is the point: a page that BATs
+// or the TLB map anywhere else simply never gets a window, and the hook path
+// keeps handling it.
+void StaticRecompCore::PublishL1Window(u32 effective_address)
+{
+  ++m_pub_calls;
+  m_guest.l1_win_host = nullptr;
+
+  auto& memory = *m_memory;
+  if (!m_guest.l1_cache || m_guest.l1_cache_size == 0 || memory.GetL1Cache() != m_guest.l1_cache)
+    return;
+  if (m_lockstep_verifier->m_ls_journaling)
+    return;
+
+  const u32 page_start = effective_address & ~0xFFFu;
+  const u32 page_last = page_start + 0xFFFu;
+  const u32 l1_offset = page_start & 0x0FFFFFFFu;
+  // The whole page must live inside the locked-cache buffer: an access near the
+  // page end has to keep taking the hook path, which is what rejects it when
+  // the hardware path would fall through to RAM/MMIO.
+  if (static_cast<u64>(l1_offset) + 0x1000ull > m_guest.l1_cache_size)
+    return;
+
+  if (m_ppc->msr.DR.Value())
+  {
+    auto& mmu = *m_mmu;
+    const auto first = mmu.GetTranslatedAddress(page_start);
+    const auto last = mmu.GetTranslatedAddress(page_last);
+    if (!first || !last || *first != page_start || *last != page_last)
+      return;
+  }
+
+  m_guest.l1_win_page = effective_address >> 12;
+  // PROBE: the module compares this against the live MSR for equality. MSR[FP]
+  // is set lazily by the guest mid-burst, so a snapshot taken before the first
+  // FP instruction can never match again. Publishing with FP forced set tests
+  // how much of the hook traffic that one bit is responsible for.
+  m_guest.l1_win_msr = m_guest.msr | 0x00002000u;
+  m_guest.l1_win_host = m_guest.l1_cache + l1_offset;
+  ++m_pub_ok;
+}
+
 void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
-  auto& memory = core->m_system.GetMemory();
-  if (ea >= LOCKED_CACHE_BASE && size != 0 &&
-      (ea - LOCKED_CACHE_BASE) + size <= memory.GetL1CacheSize())
+  ++core->m_hook_ptr_calls;
+
+  // Lockstep must observe every hardware access through the journaling MMU
+  // hooks, and odd sizes have no direct-mapping contract: fall back.
+  if (core->m_lockstep_verifier->m_ls_journaling)
+    return nullptr;
+  if (size == 0 || size > 8)
+    return nullptr;
+
+  ea = core->TranslateRelAddress(ea);
+
+  // ReadFromHardware splits cross-page accesses byte-by-byte before
+  // translating; hand those back so the hook path reproduces the split.
+  if ((ea & ~0xFFFu) != ((ea + size - 1u) & ~0xFFFu))
+    return nullptr;
+
+  // Translate exactly like the hardware path does: live MSR.DR + BAT/TLB,
+  // refreshed on every access. No identity assumption about where the
+  // window lands -- the SDK map can resolve to RAM, and a stale or wrong
+  // placement splits the module's view from the host's.
+  core->PropagateGuestMSR();
+  u32 addr = ea;
+  if (core->m_ppc->msr.DR.Value())
   {
-    return memory.GetL1Cache() + (ea - LOCKED_CACHE_BASE);
+    auto translated = core->m_mmu->GetTranslatedAddress(ea);
+    if (!translated)
+      return nullptr;  // no mapping / page fault: let the MMU hooks raise it
+    addr = *translated;
   }
-  // Everything else stays on the per-access MMU hooks: this hook receives
-  // *effective* addresses, and whether one maps to RAM depends on live
-  // MSR/BAT state that only the MMU can answer. Handing out a raw pointer
-  // here would bypass MMIO and translation. (Memory::GetPointerForRange was
-  // considered and rejected for exactly that reason.)
+
+  auto& memory = *core->m_memory;
+  // Locked L1: same guard and offset math as ReadFromHardware's branch.
+  if (memory.GetL1Cache() && (addr >> 28) == 0xE &&
+      addr < (LOCKED_CACHE_BASE + memory.GetL1CacheSize()))
+  {
+    const u32 off = addr - LOCKED_CACHE_BASE;
+    if (off + size <= memory.GetL1CacheSize())
+    {
+      ++core->m_hook_ptr_l1;
+      if (!core->m_guest.l1_win_host)
+        ++core->m_win_null;
+      else if (core->m_guest.l1_win_page != (ea >> 12))
+        ++core->m_win_page;
+      else
+      {
+        ++core->m_win_msr;
+        core->m_msr_xor |= (u64)(core->m_guest.msr ^ core->m_guest.l1_win_msr);
+        core->m_msr_pub = core->m_guest.l1_win_msr;
+        core->m_msr_live = core->m_guest.msr;
+      }
+      // Teach the module to serve this page inline from now on. After that this
+      // hook only runs again if the window is invalidated or the guest reaches
+      // a different page of the window.
+      if (!core->m_guest.l1_win_host || core->m_guest.l1_win_page != (ea >> 12))
+        core->PublishL1Window(ea);
+      return memory.GetL1Cache() + off;
+    }
+  }
+  // Plain RAM: mirror the MMU's masked-branch semantics. Games with dcache
+  // enabled must go through the MMU's dCache path, and only in-bounds
+  // mirrors get a pointer; everything else falls back to the hooks.
+  if (!core->m_ppc->m_enable_dcache && memory.GetRAM() &&
+      (addr & 0xF8000000) == 0x00000000)
+  {
+    const u32 off = addr & memory.GetRamMask();
+    if (static_cast<u64>(off) + size <= memory.GetRamSize())
+    {
+      ++core->m_hook_ptr_ram;
+      return memory.GetRAM() + off;
+    }
+  }
+  ++core->m_hook_ptr_null;
   return nullptr;
 }
 
 u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
 {
+  // Note: no L1-window invalidation here. Reading an SPR cannot change the
+  // address mapping, and mfspr DEC/TB run in the OS scheduler tick, so clearing
+  // the window on every read would just make the guest republish it.
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
-  auto& ppc = core->m_system.GetPPCState();
+  ++core->m_spr_reads;
+  core->InvalidateL1Window();
+  auto& ppc = *core->m_ppc;
   if (spr >= 1024)
   {
     ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
@@ -195,7 +329,7 @@ u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
       ppc.spr[SPR_DEC] = core->m_system.GetSystemTimers().GetFakeDecrementer();
     break;
   case SPR_WPAR:
-    if (core->m_system.GetGPFifo().IsBNE())
+    if (core->m_gpfifo->IsBNE())
       ppc.spr[SPR_WPAR] |= 1;
     else
       ppc.spr[SPR_WPAR] &= ~1u;
@@ -218,7 +352,11 @@ u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
 
 void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 {
+  // Translation state may be about to change: every BAT/TLB/HID0/MSR/SPR
+  // write lands here (or in a sibling hook). Drop the inline locked-L1 window
+  // so the next locked-cache access re-validates through the host path.
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  core->InvalidateL1Window();
   auto& system = core->m_system;
   auto& ppc = system.GetPPCState();
   if (spr >= 1024)
@@ -327,20 +465,35 @@ void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 
 void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32 cia)
 {
+  // Translation state may be about to change: every BAT/TLB/HID0/MSR/SPR
+  // write lands here (or in a sibling hook). Drop the inline locked-L1 window
+  // so the next locked-cache access re-validates through the host path.
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  core->InvalidateL1Window();
   ea = core->TranslateRelAddress(ea);
   core->PropagateGuestMSR();
-  auto& ppc = core->m_system.GetPPCState();
-  auto& mmu = core->m_system.GetMMU();
+  auto& ppc = *core->m_ppc;
+  auto& mmu = *core->m_mmu;
 
   if (operation == PPC_CACHE_ICBI)
   {
-    ppc.iCache.Invalidate(core->m_system.GetMemory(), core->m_system.GetJitInterface(), ea);
+    ++core->m_cacheop_icbi;
+    ppc.iCache.Invalidate(*core->m_memory, core->m_system.GetJitInterface(), ea);
     return;
   }
 
   if (!ppc.m_enable_dcache)
   {
+    // The only instruction-cache effect a dcb* has under static recompilation
+    // is demoting the chunks overlapping the line back to Unverified (see
+    // EmptyBlockCache). A line with no guest code on it demotes nothing, and
+    // this loop runs millions of times a second on data.
+    ++core->m_cacheop_probes;
+    if (!core->CacheOpTouchesCode(ea))
+    {
+      ++core->m_cacheop_skipped;
+      return;
+    }
     core->m_system.GetJitInterface().InvalidateICacheLine(ea);
     return;
   }
@@ -364,7 +517,12 @@ void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32
 
 void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
 {
+  // Translation state may be about to change: every BAT/TLB/HID0/MSR/SPR
+  // write lands here (or in a sibling hook). Drop the inline locked-L1 window
+  // so the next locked-cache access re-validates through the host path.
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  core->InvalidateL1Window();
+  ++core->m_fb_calls;
   cia = core->TranslateRelAddress(cia);
   ++core->m_hook_fallback_instructions;
 
@@ -394,13 +552,28 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
       const u32 rb = (raw >> 11) & 31u;
       const u32 ea = (ra ? cpu->gpr[ra] : 0u) + cpu->gpr[rb];
       if (xo == 982u)
+      {
+        ++core->m_cacheop_icbi;
         ppc.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), ea);
+      }
+      else if (core->m_skip_dataline_cacheops && !core->CacheOpTouchesCode(ea))
+      {
+        // Streaming dcb* over data: the line holds no guest code, so there is
+        // no chunk for an instruction-cache invalidation to demote. Skip the
+        // address translation and range walk entirely.
+        ++core->m_cacheop_probes;
+        ++core->m_cacheop_skipped;
+      }
       else
+      {
+        ++core->m_cacheop_probes;
         system.GetJitInterface().InvalidateICacheLine(ea);
+      }
       // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
       // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
       ppc.downcount -= (xo == 982u) ? 4 : 5;
       cpu->pc = cia + 4u;
+      ++core->m_hook_fallback_fast;
       return;
     }
   }
@@ -408,6 +581,9 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
   // The recompiled segment resumes via the dispatcher at the PC this leaves
   // behind, so this must execute exactly the instruction at cia via
   // Dolphin's interpreter and hand the register state back.
+  ++core->m_hook_fallback_slow;
+  if (core->m_collect_dispatch_samples)
+    ++core->m_fallback_words[raw];
   core->SyncOut();
   ppc.pc = cia;
   ppc.npc = cia + 4;

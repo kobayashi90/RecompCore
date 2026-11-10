@@ -4,8 +4,10 @@
 #include "DolphinNoGUI/Platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -15,6 +17,8 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
+
+#include <linux/input-event-codes.h>
 
 #include <wayland-client.h>
 #include <wayland-cursor.h>
@@ -28,6 +32,7 @@
 
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "moderngekko/hotkey.hpp"
 #include "Core/State.h"
 #include "Core/System.h"
 #include "UICommon/UICommon.h"
@@ -44,6 +49,7 @@ public:
   void SetTitle(const std::string& title) override;
   void MainLoop() override;
   void SaveWindowGeometry() override;
+  void RequestFullscreenChange(bool fullscreen) override;
   WindowSystemInfo GetWindowSystemInfo() const override;
 
   static void RegistryGlobal(void* data, wl_registry* registry, uint32_t name,
@@ -72,18 +78,20 @@ public:
   static void PointerEnter(void* data, wl_pointer*, uint32_t serial, wl_surface* surface,
                            wl_fixed_t, wl_fixed_t);
   static void PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface* surface);
-  static void PointerMotion(void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {}
-  static void PointerButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {}
-  static void PointerAxis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
-  static void PointerFrame(void*, wl_pointer*) {}
+  static void PointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y);
+  static void PointerButton(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button,
+                            uint32_t state);
+  static void PointerAxis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value);
+  static void PointerFrame(void* data, wl_pointer*);
   static void PointerAxisSource(void*, wl_pointer*, uint32_t) {}
   static void PointerAxisStop(void*, wl_pointer*, uint32_t, uint32_t) {}
-  static void PointerAxisDiscrete(void*, wl_pointer*, uint32_t, int32_t) {}
-  static void PointerAxisValue120(void*, wl_pointer*, uint32_t, int32_t) {}
+  static void PointerAxisDiscrete(void* data, wl_pointer*, uint32_t axis, int32_t discrete);
+  static void PointerAxisValue120(void* data, wl_pointer*, uint32_t axis, int32_t value120);
   static void PointerAxisRelativeDirection(void*, wl_pointer*, uint32_t, uint32_t) {}
 
 private:
   void ApplyPendingTitle();
+  void ApplyPendingFullscreen();
   bool DispatchEvents();
   void HandleHotkey(xkb_keysym_t symbol);
   bool ModifierActive(const char* name) const;
@@ -115,12 +123,43 @@ private:
   wl_surface* m_cursor_surface = nullptr;
   uint32_t m_pointer_serial = 0;
   bool m_pointer_inside = false;
+  // ImGui button mask (bit0 L, bit1 R, bit2 M) accumulated across the
+  // button events of a frame.
+  uint32_t m_pointer_buttons = 0;
+  // Scroll accumulation: Wayland delivers axis + optional discrete/value120
+  // in the same frame, flushed on wl_pointer.frame (ImGui wheel: y up > 0,
+  // Wayland positive = scroll down).
+  bool m_wheel_pending = false;
+  double m_wheel_x = 0.0;
+  double m_wheel_y = 0.0;
+  double m_wheel_120_x = 0.0;
+  double m_wheel_120_y = 0.0;
+  int32_t m_wheel_discrete_x = 0;
+  int32_t m_wheel_discrete_y = 0;
+  // Tracks the last applied pause state so cursor hiding follows the F1
+  // menu's Pause()/Resume() (both change it from this thread's hotkey path,
+  // but not only from there).
+  bool m_was_paused = false;
 
   std::thread::id m_owner_thread;
   std::mutex m_title_mutex;
   std::optional<std::string> m_pending_title;
+  // -1 = nothing pending, 0/1 = requested fullscreen state. Applied from
+  // ApplyPendingFullscreen() on the event-loop thread: wl_* proxy requests are
+  // not safe to issue from the settings menu's thread.
+  std::atomic<int> m_pending_fullscreen{-1};
   bool m_configured = false;
   bool m_resize_pending = false;
+  // Window-geometry declaration deferred until the presenter's backbuffer
+  // actually matches the configured size. Declaring geometry at ack time while
+  // the in-flight frame still commits the OLD buffer makes KWin see
+  // geometry != buffer and revert the configure (resize/maximize snap back).
+  // While a target is pending, configure events reverting to m_geometry_pre
+  // (KWin's reaction to that stale buffer) are acknowledged but not applied.
+  int32_t m_geometry_target_w = 0;
+  int32_t m_geometry_target_h = 0;
+  int32_t m_geometry_pre_w = 0;
+  int32_t m_geometry_pre_h = 0;
   bool m_screensaver_inhibited = false;
   int32_t m_width = std::max(Config::Get(Config::MAIN_RENDER_WINDOW_WIDTH), 1);
   int32_t m_height = std::max(Config::Get(Config::MAIN_RENDER_WINDOW_HEIGHT), 1);
@@ -266,8 +305,25 @@ bool PlatformWayland::Init()
 
   xdg_surface_add_listener(m_xdg_surface, &s_surface_listener, this);
   xdg_toplevel_add_listener(m_toplevel, &s_toplevel_listener, this);
-  xdg_toplevel_set_app_id(m_toplevel, "org.moderngekko.Runner");
-  xdg_toplevel_set_title(m_toplevel, "ModernGekko");
+  // The app id is what the compositor matches against StartupWMClass to pick a
+  // window icon and group windows under one launcher. One hardcoded id therefore
+  // gives every ModernGekko title the same icon; MODERNGEKKO_APP_ID lets a
+  // per-game launcher name itself so each game can carry its own icon, and the
+  // compile-time default keeps that identity even when the runner is started
+  // straight from a shell.
+#ifndef MODERNGEKKO_DEFAULT_APP_ID
+#define MODERNGEKKO_DEFAULT_APP_ID "org.moderngekko.Runner"
+#endif
+#ifndef MODERNGEKKO_DEFAULT_WINDOW_TITLE
+#define MODERNGEKKO_DEFAULT_WINDOW_TITLE "ModernGekko"
+#endif
+  const char* const app_id_env = std::getenv("MODERNGEKKO_APP_ID");
+  xdg_toplevel_set_app_id(
+      m_toplevel, (app_id_env && *app_id_env) ? app_id_env : MODERNGEKKO_DEFAULT_APP_ID);
+  // Replaced by the real title as soon as the first frame is drawn, but the
+  // window exists before that, and a single-game build should never be seen
+  // introducing itself as the emulator.
+  xdg_toplevel_set_title(m_toplevel, MODERNGEKKO_DEFAULT_WINDOW_TITLE);
   xdg_surface_set_window_geometry(m_xdg_surface, 0, 0, m_width, m_height);
   if (Config::Get(Config::MAIN_FULLSCREEN))
   {
@@ -312,15 +368,61 @@ void PlatformWayland::ApplyPendingTitle()
   }
 }
 
+void PlatformWayland::ApplyPendingFullscreen()
+{
+  const int pending = m_pending_fullscreen.exchange(-1);
+  if (pending < 0 || !m_toplevel)
+    return;
+  const bool fullscreen = pending != 0;
+  if (fullscreen == m_window_fullscreen)
+    return;
+  if (fullscreen)
+    xdg_toplevel_set_fullscreen(m_toplevel, nullptr);
+  else
+    xdg_toplevel_unset_fullscreen(m_toplevel);
+  m_window_fullscreen = fullscreen;
+  wl_surface_commit(m_surface);
+  std::fprintf(stderr, "[wl] fullscreen=%d (requested)\n", fullscreen ? 1 : 0);
+}
+
+void PlatformWayland::RequestFullscreenChange(bool fullscreen)
+{
+  m_pending_fullscreen.store(fullscreen ? 1 : 0);
+}
+
 void PlatformWayland::MainLoop()
 {
+  // While the F1 settings menu is open emulation is paused and the cursor
+  // must show inside the window; re-evaluate whenever the pause state flips.
+  m_was_paused = Core::GetState(Core::System::GetInstance()) != Core::State::Running;
   while (IsRunning())
   {
     UpdateRunningFlag();
     Core::HostDispatchJobs(Core::System::GetInstance());
     ApplyPendingTitle();
+    ApplyPendingFullscreen();
     if (!DispatchEvents())
       break;
+    // Declare the window geometry once the swap chain has actually been
+    // recreated at the configured size (the buffer KWin sees then matches
+    // the declaration, so nothing reverts). ~500 checks/s, trivial cost.
+    if (m_geometry_target_w > 0 && g_presenter &&
+        g_presenter->GetBackbufferWidth() == m_geometry_target_w &&
+        g_presenter->GetBackbufferHeight() == m_geometry_target_h)
+    {
+      xdg_surface_set_window_geometry(m_xdg_surface, 0, 0, m_geometry_target_w,
+                                      m_geometry_target_h);
+      std::fprintf(stderr, "[wl] window geometry set %dx%d (buffer landed)\n",
+                   m_geometry_target_w, m_geometry_target_h);
+      m_geometry_target_w = 0;
+      m_geometry_target_h = 0;
+    }
+    const bool paused = Core::GetState(Core::System::GetInstance()) != Core::State::Running;
+    if (paused != m_was_paused)
+    {
+      m_was_paused = paused;
+      UpdateCursor();
+    }
   }
 }
 
@@ -437,13 +539,17 @@ void PlatformWayland::SurfaceConfigure(void* data, xdg_surface* surface, uint32_
   xdg_surface_ack_configure(surface, serial);
   if (platform->m_resize_pending)
   {
+    platform->m_geometry_pre_w = platform->m_width;
+    platform->m_geometry_pre_h = platform->m_height;
     platform->m_width = platform->m_pending_width;
     platform->m_height = platform->m_pending_height;
-    xdg_surface_set_window_geometry(platform->m_xdg_surface, 0, 0, platform->m_width,
-                                    platform->m_height);
+    platform->m_geometry_target_w = platform->m_width;
+    platform->m_geometry_target_h = platform->m_height;
     platform->m_resize_pending = false;
+    std::fprintf(stderr, "[wl] surface applied resize %dx%d (geometry deferred)\n",
+                 platform->m_width, platform->m_height);
     if (g_presenter)
-      g_presenter->ResizeSurface();
+      g_presenter->ResizeSurface(platform->m_width, platform->m_height);
   }
   platform->m_configured = true;
 }
@@ -462,9 +568,23 @@ void PlatformWayland::ToplevelConfigure(void* data, xdg_toplevel*, int32_t width
   }
   platform->m_window_fullscreen = fullscreen;
 
+  std::fprintf(stderr, "[wl] toplevel configure %dx%d fullscreen=%d\n", width, height,
+               fullscreen ? 1 : 0);
+
   if (width > 0 && height > 0 &&
       (width != platform->m_width || height != platform->m_height))
   {
+    if (platform->m_geometry_target_w > 0 && width == platform->m_geometry_pre_w &&
+        height == platform->m_geometry_pre_h)
+    {
+      // KWin reacting to the one stale (old-size) frame our ack raced ahead
+      // of — a suggestion, not a request. Ack only; the new-size buffer lands
+      // within a frame and MainLoop then declares the real geometry.
+      std::fprintf(stderr, "[wl] ignoring revert-configure %dx%d (target %dx%d in flight)\n",
+                   width, height, platform->m_geometry_target_w,
+                   platform->m_geometry_target_h);
+      return;
+    }
     platform->m_pending_width = width;
     platform->m_pending_height = height;
     platform->m_resize_pending = true;
@@ -593,9 +713,17 @@ void PlatformWayland::KeyboardKey(void* data, wl_keyboard*, uint32_t, uint32_t, 
                                   uint32_t state)
 {
   auto* platform = static_cast<PlatformWayland*>(data);
-  if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !platform->m_xkb_state)
+  if (!platform->m_xkb_state)
     return;
-  platform->HandleHotkey(xkb_state_key_get_one_sym(platform->m_xkb_state, key + 8));
+  const bool down = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+  const xkb_keysym_t sym = xkb_state_key_get_one_sym(platform->m_xkb_state, key + 8);
+  // Feed the OSD ImGui context first (the F1 settings menu draws inside the
+  // game window through it) — releases must reach it too, so the menu never
+  // sees a stuck key.
+  if (g_presenter)
+    g_presenter->SetKeysym(static_cast<u32>(sym), down);
+  if (down)
+    platform->HandleHotkey(sym);
 }
 
 void PlatformWayland::KeyboardModifiers(void* data, wl_keyboard*, uint32_t, uint32_t depressed,
@@ -616,6 +744,11 @@ bool PlatformWayland::ModifierActive(const char* name) const
 
 void PlatformWayland::HandleHotkey(xkb_keysym_t symbol)
 {
+  // The frontend (settings menu) gets first refusal on keys like F1 so it
+  // can claim them before the savestate hotkey range below.
+  if (moderngekko::NotifyHotkey(static_cast<unsigned>(symbol)))
+    return;
+
   auto& system = Core::System::GetInstance();
   if (symbol == XKB_KEY_Escape && ModifierActive(XKB_MOD_NAME_CTRL))
   {
@@ -678,6 +811,112 @@ void PlatformWayland::PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface
   auto* platform = static_cast<PlatformWayland*>(data);
   if (surface == platform->m_surface)
     platform->m_pointer_inside = false;
+}
+
+void PlatformWayland::PointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y)
+{
+  if (!g_presenter)
+    return;
+  // Surface-local coordinates scaled to the backbuffer the OSD draws into
+  // (HiDPI: the OSD ImGui context works in physical pixels).
+  const float scale = g_presenter->GetBackbufferScale();
+  g_presenter->SetMousePos(static_cast<float>(wl_fixed_to_double(x)) * scale,
+                           static_cast<float>(wl_fixed_to_double(y)) * scale);
+}
+
+void PlatformWayland::PointerButton(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button,
+                                    uint32_t state)
+{
+  auto* platform = static_cast<PlatformWayland*>(data);
+  uint32_t bit = 0;
+  switch (button)
+  {
+  case BTN_LEFT:
+    bit = 1u << 0;
+    break;
+  case BTN_RIGHT:
+    bit = 1u << 1;
+    break;
+  case BTN_MIDDLE:
+    bit = 1u << 2;
+    break;
+  default:
+    return;
+  }
+  if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+    platform->m_pointer_buttons |= bit;
+  else
+    platform->m_pointer_buttons &= ~bit;
+  if (g_presenter)
+    g_presenter->SetMousePress(platform->m_pointer_buttons);
+}
+
+void PlatformWayland::PointerAxis(void* data, wl_pointer*, uint32_t, uint32_t axis,
+                                  wl_fixed_t value)
+{
+  auto* platform = static_cast<PlatformWayland*>(data);
+  // Wayland: positive = scroll down; ImGui wheel y: positive = scroll up.
+  const double v = wl_fixed_to_double(value);
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    platform->m_wheel_y += -v / 10.0;
+  else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    platform->m_wheel_x += v / 10.0;
+  platform->m_wheel_pending = true;
+}
+
+void PlatformWayland::PointerAxisDiscrete(void* data, wl_pointer*, uint32_t axis,
+                                          int32_t discrete)
+{
+  auto* platform = static_cast<PlatformWayland*>(data);
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    platform->m_wheel_discrete_y += -discrete;
+  else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    platform->m_wheel_discrete_x += discrete;
+  platform->m_wheel_pending = true;
+}
+
+void PlatformWayland::PointerAxisValue120(void* data, wl_pointer*, uint32_t axis,
+                                          int32_t value120)
+{
+  auto* platform = static_cast<PlatformWayland*>(data);
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    platform->m_wheel_120_y += -value120;
+  else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    platform->m_wheel_120_x += value120;
+  platform->m_wheel_pending = true;
+}
+
+void PlatformWayland::PointerFrame(void* data, wl_pointer*)
+{
+  auto* platform = static_cast<PlatformWayland*>(data);
+  if (!platform->m_wheel_pending)
+    return;
+  platform->m_wheel_pending = false;
+
+  double x = 0.0;
+  double y = 0.0;
+  if (platform->m_wheel_120_x != 0.0 || platform->m_wheel_120_y != 0.0)
+  {
+    // High-resolution scroll: 120 units per wheel click.
+    x = platform->m_wheel_120_x / 120.0;
+    y = platform->m_wheel_120_y / 120.0;
+  }
+  else if (platform->m_wheel_discrete_x != 0 || platform->m_wheel_discrete_y != 0)
+  {
+    x = static_cast<double>(platform->m_wheel_discrete_x);
+    y = static_cast<double>(platform->m_wheel_discrete_y);
+  }
+  else
+  {
+    x = platform->m_wheel_x;
+    y = platform->m_wheel_y;
+  }
+  platform->m_wheel_x = platform->m_wheel_y = 0.0;
+  platform->m_wheel_120_x = platform->m_wheel_120_y = 0.0;
+  platform->m_wheel_discrete_x = platform->m_wheel_discrete_y = 0;
+
+  if ((x != 0.0 || y != 0.0) && g_presenter)
+    g_presenter->SetMouseWheel(static_cast<float>(x), static_cast<float>(y));
 }
 
 void PlatformWayland::UpdateCursor()

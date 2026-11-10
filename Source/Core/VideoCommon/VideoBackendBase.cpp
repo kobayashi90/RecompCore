@@ -4,6 +4,7 @@
 #include "VideoCommon/VideoBackendBase.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -107,7 +108,11 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
 
     const TimePoint presentation_time = core_timing.GetTargetHostTime(ticks);
     AsyncRequests::GetInstance()->PushEvent([=] {
-      g_presenter->ViSwap(xfb_addr, fb_width, fb_stride, fb_height, ticks, presentation_time);
+      // Async: may run during/after shutdown — must not race
+      // g_presenter.reset() (use-after-free in the presenter).
+      VideoCommon::Presenter::WithPresenter([&](VideoCommon::Presenter& presenter) {
+        presenter.ViSwap(xfb_addr, fb_width, fb_stride, fb_height, ticks, presentation_time);
+      });
     });
   }
 
@@ -122,7 +127,9 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
   const auto next_swap_estimated_time = core_timing.GetTargetHostTime(next_swap_estimated_ticks);
 
   AsyncRequests::GetInstance()->PushEvent([=] {
-    g_presenter->SetNextSwapEstimatedTime(next_swap_estimated_ticks, next_swap_estimated_time);
+    VideoCommon::Presenter::WithPresenter([&](VideoCommon::Presenter& presenter) {
+      presenter.SetNextSwapEstimatedTime(next_swap_estimated_ticks, next_swap_estimated_time);
+    });
   });
 }
 
@@ -373,11 +380,13 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
 
 void VideoBackendBase::ShutdownShared()
 {
+  std::fprintf(stderr, "[diag] video shutdown begin\n");
+
   auto& system = Core::System::GetInstance();
   system.GetCustomResourceManager().Shutdown();
 
   g_frame_dumper.reset();
-  g_presenter.reset();
+  VideoCommon::Presenter::Shutdown();
 
   if (g_shader_cache)
     g_shader_cache->Shutdown();

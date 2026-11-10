@@ -47,6 +47,15 @@ void AddTypedMessage(MessageType type, std::string message, u32 ms = Duration::S
                      const VideoCommon::CustomTextureData::ArraySlice::Level* icon = nullptr);
 
 // Draw the current messages on the screen. Only call once per frame.
+// Frontend hook for rewriting or swallowing OSD text before it is queued.
+// Return true to consume the message -- the frontend is presenting that piece
+// of information itself, in its own style, and does not want Dolphin's yellow
+// rectangle on top of it. `message` may be rewritten in place when returning
+// false. Called from whichever thread emits the message, so implementations
+// must be cheap and must not call back into OSD.
+using MessageFilter = std::function<bool(std::string& message)>;
+void SetMessageFilter(MessageFilter filter);
+
 void DrawMessages();
 void ClearMessages();
 

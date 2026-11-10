@@ -24,10 +24,28 @@
 #include "VideoCommon/VideoEvents.h"
 #include "VideoCommon/Widescreen.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 std::unique_ptr<VideoCommon::Presenter> g_presenter;
+
+// MODERNGEKKO diagnostic counters, defined in BPStructs.cpp. See MODERNGEKKO_PRES_DEBUG.
+extern u64 g_mg_xfb_copy_total;
+extern u64 g_mg_xfb_copy_seq_at[4096];
+
+// The address the presenter last asked the texture cache for. Read by the
+// swapchain dump in VKGfx so a captured picture can be tied back to the XFB copy
+// that produced it.
+u32 g_mg_last_present_addr = 0;
 
 namespace VideoCommon
 {
+std::mutex Presenter::s_forced_present_mutex;
+
 // Stretches the native/internal analog resolution aspect ratio from ~4:3 to ~16:9
 static float SourceAspectRatioToWidescreen(float source_aspect)
 {
@@ -106,6 +124,12 @@ Presenter::Presenter()
 
 Presenter::~Presenter()
 {
+  // Reached only via Shutdown(), which already holds s_forced_present_mutex
+  // for the whole null+destroy sequence — so no forced/async present can be
+  // in flight here. Wait out any Present() running on an unguarded path
+  // (e.g. DoState -> ImmediateSwap) instead.
+  std::lock_guard present_lock(m_present_mutex);
+
   // Disable ControllerInterface's aspect ratio adjustments so mapping dialog behaves normally.
   g_controller_interface.SetAspectRatioAdjustment(1);
 }
@@ -157,10 +181,115 @@ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_heigh
     m_xfb_entry->AcquireContentLock();
   }
   m_last_xfb_addr = xfb_addr;
+  g_mg_last_present_addr = xfb_addr;
   m_last_xfb_ticks = ticks;
   m_last_xfb_width = fb_width;
   m_last_xfb_stride = fb_stride;
   m_last_xfb_height = fb_height;
+
+  // MODERNGEKKO_XFB_TEX_DUMP=<dir> reads the texture cache's XFB copy itself
+  // back, per present, and hashes/dumps it. The swapchain dump shows what is
+  // drawn; this shows what was *available to draw*. If this sequence is smooth
+  // while the swapchain alternates, the fault is in the present path. If this
+  // alternates too, the render (or the copy) is already producing two pictures.
+  if (m_xfb_entry && m_xfb_entry->texture)
+  {
+    static const char* const tex_dump_dir = std::getenv("MODERNGEKKO_XFB_TEX_DUMP");
+    static const int tex_dump_max = [] {
+      const char* const value = std::getenv("MODERNGEKKO_XFB_TEX_DUMP_MAX");
+      return value ? std::atoi(value) : 0;
+    }();
+    static const int tex_dump_skip = [] {
+      const char* const value = std::getenv("MODERNGEKKO_XFB_TEX_DUMP_SKIP");
+      return value ? std::atoi(value) : 0;
+    }();
+    static AbstractStagingTexture* tex_staging = nullptr;
+    static u32 tex_width = 0;
+    static u32 tex_height = 0;
+    static u64 tex_index = 0;
+    if (tex_dump_dir && g_gfx)
+    {
+      const TextureConfig cfg = m_xfb_entry->texture->GetConfig();
+      if (!tex_staging || tex_width != cfg.width || tex_height != cfg.height)
+      {
+        tex_staging = g_gfx->CreateStagingTexture(StagingTextureType::Readback, cfg).release();
+        tex_width = cfg.width;
+        tex_height = cfg.height;
+        std::fprintf(stderr, "[xfbtex] staging %ux%u\n", cfg.width, cfg.height);
+        std::fflush(stderr);
+      }
+      const u64 index = tex_index++;
+      const bool wanted = index >= static_cast<u64>(tex_dump_skip) &&
+                          (tex_dump_max == 0 || index < static_cast<u64>(tex_dump_skip + tex_dump_max));
+      if (tex_staging && wanted)
+      {
+        const MathUtil::Rectangle<int> rect(0, 0, cfg.width, cfg.height);
+        tex_staging->CopyFromTexture(m_xfb_entry->texture.get(), rect, 0, 0, rect);
+        tex_staging->Flush();
+        const u8* const src = reinterpret_cast<const u8*>(tex_staging->GetMappedPointer());
+        const size_t stride = tex_staging->GetMappedStride();
+        const u32 texel = static_cast<u32>(tex_staging->GetTexelSize());
+        std::vector<u8> luma(static_cast<size_t>(cfg.width) * cfg.height);
+        u64 hash = 0xcbf29ce484222325ULL;
+        for (u32 y = 0; y < cfg.height; ++y)
+        {
+          const u8* const row = src + y * stride;
+          u8* const out = luma.data() + static_cast<size_t>(y) * cfg.width;
+          for (u32 x = 0; x < cfg.width; ++x)
+          {
+            const u8 value = row[x * texel + 1];
+            out[x] = value;
+            hash = (hash ^ value) * 0x100000001b3ULL;
+          }
+        }
+        const u64 copy_seq =
+            xfb_addr ? g_mg_xfb_copy_seq_at[(xfb_addr >> 6) & 4095] : 0;
+        std::fprintf(stderr, "[xfbtex] i=%llu addr=%08x copy=%llu total=%llu hash=%016llx\n",
+                     static_cast<unsigned long long>(index), xfb_addr,
+                     static_cast<unsigned long long>(copy_seq),
+                     static_cast<unsigned long long>(g_mg_xfb_copy_total),
+                     static_cast<unsigned long long>(hash));
+        std::fflush(stderr);
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/xfb-%05llu.pgm", tex_dump_dir,
+                      static_cast<unsigned long long>(index));
+        if (FILE* const file = std::fopen(path, "wb"))
+        {
+          std::fprintf(file, "P5\n%u %u\n255\n", cfg.width, cfg.height);
+          std::fwrite(luma.data(), 1, luma.size(), file);
+          std::fclose(file);
+        }
+        tex_staging->Unmap();
+      }
+    }
+  }
+
+  // MODERNGEKKO_PRES_DEBUG=1 logs every present with the age of the picture it
+  // is about to display, counted in XFB copies. Age 0 means "this is the copy
+  // that was just produced"; anything else is a stale read.
+  {
+    static const bool pres_debug = [] {
+      const char* value = std::getenv("MODERNGEKKO_PRES_DEBUG");
+      return value && *value == '1';
+    }();
+    if (pres_debug)
+    {
+      static u64 seq = 0;
+      const u64 copy_seq =
+          xfb_addr ? g_mg_xfb_copy_seq_at[(xfb_addr >> 6) & 4095] : 0;
+      std::fprintf(stderr,
+                   "[pres] n=%llu addr=%08x id=%llu w=%u h=%u stride=%u copy=%llu "
+                   "total=%llu age=%lld dup=%d\n",
+                   static_cast<unsigned long long>(seq++), xfb_addr,
+                   static_cast<unsigned long long>(m_last_xfb_id), fb_width, fb_height, fb_stride,
+                   static_cast<unsigned long long>(copy_seq),
+                   static_cast<unsigned long long>(g_mg_xfb_copy_total),
+                   static_cast<long long>(g_mg_xfb_copy_total) -
+                       static_cast<long long>(copy_seq),
+                   (old_xfb_id == m_last_xfb_id) ? 1 : 0);
+      std::fflush(stderr);
+    }
+  }
 
   return old_xfb_id == m_last_xfb_id;
 }
@@ -590,10 +719,23 @@ void Presenter::ChangeSurface(void* new_surface_handle)
   m_surface_changed.Set();
 }
 
-void Presenter::ResizeSurface()
+void Presenter::ResizeSurface(int width, int height)
 {
   std::lock_guard<std::mutex> lock(m_swap_mutex);
   m_surface_resized.Set();
+  m_requested_surface_width = width > 0 ? width : 0;
+  m_requested_surface_height = height > 0 ? height : 0;
+  std::fprintf(stderr, "[presenter] resize flag set (%dx%d)\n", m_requested_surface_width,
+               m_requested_surface_height);
+}
+
+void Presenter::TakeRequestedSurfaceSize(int& width, int& height)
+{
+  std::lock_guard<std::mutex> lock(m_swap_mutex);
+  width = m_requested_surface_width;
+  height = m_requested_surface_height;
+  m_requested_surface_width = 0;
+  m_requested_surface_height = 0;
 }
 
 void* Presenter::GetNewSurfaceHandle()
@@ -899,8 +1041,91 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
   }
 }
 
+namespace
+{
+// MODERNGEKKO_PACING_DEBUG=1 reports the interval between completed presents,
+// bucketed in whole milliseconds. This is the only way to tell "the emulator
+// ran slow" apart from "the emulator hit its frame rate but the frames landed on
+// an uneven grid" -- the latter reads as a perfect fps counter and still looks
+// like judder to a human, because the eye sees the hold times, not the count.
+void ReportPresentInterval()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("MODERNGEKKO_PACING_DEBUG");
+    return value && *value == '1';
+  }();
+  if (!enabled)
+    return;
+
+  using Clock = std::chrono::steady_clock;
+  // Buckets 0..59 ms plus a final overflow bucket.
+  constexpr int kBuckets = 60;
+  static Clock::time_point previous = Clock::now();
+  static auto window_start = previous;
+  static unsigned counts[kBuckets + 1] = {};
+  static unsigned total = 0;
+  static unsigned long long sum_us = 0;
+  static int min_ms = 1 << 30;
+  static int max_ms = 0;
+
+  const auto now = Clock::now();
+  const auto delta = now - previous;
+  previous = now;
+  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(delta).count();
+  const int ms = static_cast<int>(us / 1000);
+  counts[ms < kBuckets ? ms : kBuckets]++;
+  total++;
+  sum_us += static_cast<unsigned long long>(us);
+  if (ms < min_ms)
+    min_ms = ms;
+  if (ms > max_ms)
+    max_ms = ms;
+
+  const auto window_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - window_start).count();
+  if (window_ms < 1000)
+    return;
+
+  const double mean = total ? static_cast<double>(sum_us) / total / 1000.0 : 0.0;
+  std::fprintf(stderr, "[pacing] n=%u mean=%.2fms min=%d max=%d |", total, mean, min_ms, max_ms);
+  for (int i = 0; i <= kBuckets; i++)
+  {
+    if (counts[i] == 0)
+      continue;
+    if (i == kBuckets)
+      std::fprintf(stderr, " >=%dms:%u", kBuckets, counts[i]);
+    else
+      std::fprintf(stderr, " %dms:%u", i, counts[i]);
+  }
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+
+  for (auto& c : counts)
+    c = 0;
+  total = 0;
+  sum_us = 0;
+  min_ms = 1 << 30;
+  max_ms = 0;
+  window_start = now;
+}
+}  // namespace
+
 void Presenter::Present(PresentInfo* present_info)
 {
+  // Serializes ViSwap/ImmediateSwap presents against the settings menu's
+  // forced presents while emulation is paused.
+  std::lock_guard present_lock(m_present_mutex);
+
+  // Diagnostic: which threads present (first time only).
+  {
+    static thread_local const bool logged = [] {
+      std::fprintf(stderr, "[diag] Present from tid=%lu\n",
+                   static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+      return true;
+    }();
+    (void)logged;
+  }
+
   m_present_count++;
 
   if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
@@ -966,6 +1191,7 @@ void Presenter::Present(PresentInfo* present_info)
     }
 
     g_gfx->PresentBackbuffer();
+    ReportPresentInterval();
   }
 
   if (m_xfb_entry)
@@ -1032,6 +1258,71 @@ void Presenter::SetMousePress(u32 button_mask)
 {
   if (m_onscreen_ui)
     m_onscreen_ui->SetMousePress(button_mask);
+}
+
+void Presenter::SetKeysym(u32 keysym, bool is_down)
+{
+  if (m_onscreen_ui)
+    m_onscreen_ui->SetKeysym(keysym, is_down);
+}
+
+void Presenter::SetMouseWheel(float x, float y)
+{
+  if (m_onscreen_ui)
+    m_onscreen_ui->SetMouseWheel(x, y);
+}
+
+bool Presenter::OverlayPresentReady() const
+{
+  return g_gfx && !g_gfx->IsHeadless() && m_onscreen_ui && m_onscreen_ui->IsReady() &&
+         m_backbuffer_format != AbstractTextureFormat::Undefined;
+}
+
+void Presenter::PresentOverlayFrame()
+{
+  std::lock_guard lock(s_forced_present_mutex);
+  if (!g_presenter || !g_presenter->OverlayPresentReady())
+    return;
+  // No present_info: no frame-pacing sleep, we pace the loop ourselves.
+  g_presenter->Present(nullptr);
+  // Screenshot requests are normally serviced by ProcessFrameDumping() on the
+  // emulated-frame path. While the settings menu is open the core is paused,
+  // so that path never runs and a screenshot request was silently dropped (no
+  // file, no error). The XFB entry of the last presented frame is still valid
+  // -- the overlay present re-samples that same entry -- so dumping it here is
+  // the same operation the emulated path performs for a static picture.
+  //
+  // The null check is load-bearing: g_frame_dumper is reset when the video
+  // backend shuts down, and unlike the emulated-frame path this one can still
+  // run at that moment (the menu thread keeps presenting until ConfigMenu::Stop
+  // joins it). ProcessFrameDumping() dereferences the pointer unconditionally,
+  // so calling it unguarded here was a SIGSEGV in IsFrameDumping() on shutdown.
+  if (g_frame_dumper && g_frame_dumper->IsFrameDumping())
+  {
+    g_presenter->ProcessFrameDumping(g_presenter->m_next_swap_estimated_ticks);
+    // The dump is only staged by ProcessFrameDumping(); it reaches the encoder /
+    // PNG writer in FlushFrameDump(), which normally runs off after_frame_event
+    // -- an event only the emulated core fires. Flushing here is what actually
+    // makes a screenshot taken with the menu open land on disk.
+    g_frame_dumper->FlushFrameDump();
+  }
+}
+
+void Presenter::WithPresenter(const std::function<void(Presenter&)>& fn)
+{
+  std::lock_guard lock(s_forced_present_mutex);
+  if (g_presenter)
+    fn(*g_presenter);
+}
+
+void Presenter::Shutdown()
+{
+  // Null + destroy atomically w.r.t. every s_forced_present_mutex holder:
+  // an in-flight forced/async Present keeps seeing a valid g_presenter for
+  // its whole duration (PostProcessing::BlitFromTexture re-reads the global
+  // mid-call — that was the SIGSEGV on "Save && restart").
+  std::lock_guard lock(s_forced_present_mutex);
+  g_presenter.reset();
 }
 
 void Presenter::DoState(PointerWrap& p)

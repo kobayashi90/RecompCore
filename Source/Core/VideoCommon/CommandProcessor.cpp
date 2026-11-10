@@ -4,6 +4,8 @@
 #include "VideoCommon/CommandProcessor.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 
 #include "Common/Assert.h"
@@ -83,15 +85,24 @@ void SCPFifoStruct::DoState(PointerWrap& p)
 
 void CommandProcessorManager::DoState(PointerWrap& p)
 {
+  FlushPendingGatherPipe();
   p.Do(m_cp_status_reg);
   p.Do(m_cp_ctrl_reg);
   p.Do(m_cp_clear_reg);
   p.Do(m_perf_select);
   p.Do(m_unk_0a_reg);
   m_fifo.DoState(p);
+  RefreshFifoInterruptFlag();
 
   p.Do(m_interrupt_set);
   p.Do(m_interrupt_waiting);
+}
+
+void CommandProcessorManager::RefreshFifoInterruptFlag()
+{
+  m_ctrl_hex_seen = m_cp_ctrl_reg.Hex;
+  m_fifo_interrupts_possible = m_cp_ctrl_reg.BPInt || m_cp_ctrl_reg.FifoOverflowIntEnable ||
+                               m_cp_ctrl_reg.FifoUnderflowIntEnable;
 }
 
 static inline void WriteHigh(std::atomic<u32>& reg, u16 highbits)
@@ -106,6 +117,16 @@ CommandProcessorManager::CommandProcessorManager(Core::System& system) : m_syste
 
 void CommandProcessorManager::Init()
 {
+  if (const char* const gate = std::getenv("STATICRECOMP_FIFO_GATE"))
+    m_fifo_status_gate = std::strcmp(gate, "0") != 0;
+
+  // Gather-pipe publish coalescing. 1 restores upstream's per-block publishes.
+  if (const char* const batch = std::getenv("STATICRECOMP_GATHER_BATCH"))
+  {
+    const long parsed = std::strtol(batch, nullptr, 10);
+    m_gather_batch = parsed < 1 ? 1 : static_cast<u32>(parsed);
+  }
+
   m_cp_status_reg.Hex = 0;
   m_cp_status_reg.CommandIdle = 1;
   m_cp_status_reg.ReadIdle = 1;
@@ -336,15 +357,73 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   mmio->Register(base | FIFO_READ_POINTER_HI, fifo_read_hi_r, fifo_read_hi_w);
 }
 
-void CommandProcessorManager::GatherPipeBursted()
+void CommandProcessorManager::FlushPendingGatherPipe()
 {
-  SetCPStatusFromCPU();
+  if (m_pending_gather_blocks == 0)
+    return;
+
+  const u32 blocks = m_pending_gather_blocks;
+  const u32 bytes = blocks * GPFifo::GATHER_PIPE_SIZE;
+  m_pending_gather_blocks = 0;
 
   auto& processor_interface = m_system.GetProcessorInterface();
+
+  // GPFifo advances processor_interface.m_fifo_cpu_write_pointer as it copies
+  // each block (it owns the ring cursor between publishes); this is where the
+  // shared copy the guest and the status register see gets caught up.
+  m_fifo.CPWritePointer.store(processor_interface.m_fifo_cpu_write_pointer,
+                              std::memory_order_relaxed);
+
+  // Status is evaluated against the distance as it stood before this batch, the
+  // same order upstream uses (SetCPStatusFromCPU ran at the top of the burst).
+  SetCPStatusFromCPU();
+
+  const u32 distance =
+      m_fifo.CPReadWriteDistance.fetch_add(bytes, std::memory_order_seq_cst) + bytes;
+
+  // If the game is running close to overflowing, make the exception checking
+  // more frequent. Derived from the live distance rather than a cached flag.
+  if (distance > m_max_distance_seen)
+    m_max_distance_seen = distance;
+  if (distance > m_fifo.CPHiWatermark)
+    m_system.GetCoreTiming().ForceExceptionCheck(0);
+
+  m_system.GetFifo().RunGpu();
+
+  // Each of these re-reads atomics on the cache line the GPU thread is actively
+  // writing. They can only fire on a genuine FIFO desync, so keep them for
+  // debugging rather than in the hot path.
+  static const bool check_fifo_asserts = std::getenv("STATICRECOMP_FIFO_ASSERTS") != nullptr;
+  if (check_fifo_asserts)
+  {
+    ASSERT_MSG(COMMANDPROCESSOR,
+               m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) <=
+                   m_fifo.CPEnd.load(std::memory_order_relaxed) -
+                       m_fifo.CPBase.load(std::memory_order_relaxed),
+               "FIFO is overflowed by GatherPipe !\nCPU thread is too fast!");
+
+    ASSERT_MSG(COMMANDPROCESSOR,
+               m_fifo.CPWritePointer.load(std::memory_order_relaxed) ==
+                   processor_interface.m_fifo_cpu_write_pointer,
+               "FIFOs linked but out of sync");
+    ASSERT_MSG(COMMANDPROCESSOR,
+               m_fifo.CPBase.load(std::memory_order_relaxed) == processor_interface.m_fifo_cpu_base,
+               "FIFOs linked but out of sync");
+    ASSERT_MSG(COMMANDPROCESSOR,
+               m_fifo.CPEnd.load(std::memory_order_relaxed) == processor_interface.m_fifo_cpu_end,
+               "FIFOs linked but out of sync");
+  }
+}
+
+void CommandProcessorManager::GatherPipeBursted(u32 blocks)
+{
+  m_gather_bursts += blocks;
 
   // if we aren't linked, we don't care about gather pipe data
   if (!m_cp_ctrl_reg.GPLinkEnable)
   {
+    SetCPStatusFromCPU();
+    auto& processor_interface = m_system.GetProcessorInterface();
     if (IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
     {
       // In multibuffer mode is not allowed write in the same FIFO attached to the GPU.
@@ -360,50 +439,11 @@ void CommandProcessorManager::GatherPipeBursted()
     return;
   }
 
-  // update the fifo pointer
-  if (m_fifo.CPWritePointer.load(std::memory_order_relaxed) ==
-      m_fifo.CPEnd.load(std::memory_order_relaxed))
-  {
-    m_fifo.CPWritePointer.store(m_fifo.CPBase, std::memory_order_relaxed);
-  }
-  else
-  {
-    m_fifo.CPWritePointer.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_relaxed);
-  }
+  m_pending_gather_blocks += blocks;
+  if (m_gather_batch > 1 && m_pending_gather_blocks < m_gather_batch)
+    return;
 
-  if (m_cp_ctrl_reg.GPReadEnable && m_cp_ctrl_reg.GPLinkEnable)
-  {
-    processor_interface.m_fifo_cpu_write_pointer =
-        m_fifo.CPWritePointer.load(std::memory_order_relaxed);
-    processor_interface.m_fifo_cpu_base = m_fifo.CPBase.load(std::memory_order_relaxed);
-    processor_interface.m_fifo_cpu_end = m_fifo.CPEnd.load(std::memory_order_relaxed);
-  }
-
-  // If the game is running close to overflowing, make the exception checking more frequent.
-  if (m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) != 0)
-    m_system.GetCoreTiming().ForceExceptionCheck(0);
-
-  m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
-
-  m_system.GetFifo().RunGpu();
-
-  ASSERT_MSG(COMMANDPROCESSOR,
-             m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) <=
-                 m_fifo.CPEnd.load(std::memory_order_relaxed) -
-                     m_fifo.CPBase.load(std::memory_order_relaxed),
-             "FIFO is overflowed by GatherPipe !\nCPU thread is too fast!");
-
-  // check if we are in sync
-  ASSERT_MSG(COMMANDPROCESSOR,
-             m_fifo.CPWritePointer.load(std::memory_order_relaxed) ==
-                 processor_interface.m_fifo_cpu_write_pointer,
-             "FIFOs linked but out of sync");
-  ASSERT_MSG(COMMANDPROCESSOR,
-             m_fifo.CPBase.load(std::memory_order_relaxed) == processor_interface.m_fifo_cpu_base,
-             "FIFOs linked but out of sync");
-  ASSERT_MSG(COMMANDPROCESSOR,
-             m_fifo.CPEnd.load(std::memory_order_relaxed) == processor_interface.m_fifo_cpu_end,
-             "FIFOs linked but out of sync");
+  FlushPendingGatherPipe();
 }
 
 void CommandProcessorManager::UpdateInterrupts(u64 userdata)
@@ -475,34 +515,16 @@ void CommandProcessorManager::SetCPStatusFromGPU()
     }
   }
 
-  // overflow & underflow check
-  m_fifo.bFF_HiWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark),
-      std::memory_order_relaxed);
-  m_fifo.bFF_LoWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark),
-      std::memory_order_relaxed);
-
-  bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
-               m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
-  bool ovfInt = m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) &&
-                m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
-  bool undfInt = m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) &&
-                 m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
-
-  bool interrupt = (bpInt || ovfInt || undfInt) && m_cp_ctrl_reg.GPReadEnable;
+  const bool interrupt = ComputeFifoInterrupt();
 
   if (interrupt != m_interrupt_set.IsSet() && !m_interrupt_waiting.IsSet())
   {
     const u64 userdata = interrupt ? 1 : 0;
     if (IsOnThread(m_system))
     {
-      if (!interrupt || bpInt || undfInt || ovfInt)
-      {
-        // Schedule the interrupt asynchronously
-        m_interrupt_waiting.Set();
-        UpdateInterruptsFromVideoBackend(userdata);
-      }
+      // Schedule the interrupt asynchronously
+      m_interrupt_waiting.Set();
+      UpdateInterruptsFromVideoBackend(userdata);
     }
     else
     {
@@ -511,36 +533,52 @@ void CommandProcessorManager::SetCPStatusFromGPU()
   }
 }
 
+bool CommandProcessorManager::ComputeFifoInterrupt()
+{
+  if (!m_fifo_status_gate)
+  {
+    // Legacy A/B path (STATICRECOMP_FIFO_GATE=0): cache the watermark bits into
+    // the FIFO struct on every call, exactly as upstream does. Kept so the cost
+    // of those two stores can be measured against the same binary.
+    const u32 distance = m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+    m_fifo.bFF_HiWatermark.store(distance > m_fifo.CPHiWatermark, std::memory_order_relaxed);
+    m_fifo.bFF_LoWatermark.store(distance < m_fifo.CPLoWatermark, std::memory_order_relaxed);
+  }
+
+  if (!m_cp_ctrl_reg.GPReadEnable)
+    return false;
+
+  if (m_fifo.bFF_BPInt.load(std::memory_order_relaxed) &&
+      m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed))
+  {
+    return true;
+  }
+
+  // The overflow/underflow interrupt enables are almost always clear in practice
+  // (this game sets overflow only, and nothing else), so test them before
+  // touching the read/write distance the GPU thread is actively updating.
+  const bool hi_int = m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed) != 0;
+  const bool lo_int = m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed) != 0;
+  if (!hi_int && !lo_int)
+    return false;
+
+  const u32 distance = m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+  return (hi_int && distance > m_fifo.CPHiWatermark) ||
+         (lo_int && distance < m_fifo.CPLoWatermark);
+}
+
 void CommandProcessorManager::SetCPStatusFromCPU()
 {
-  // overflow & underflow check
-  m_fifo.bFF_HiWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark),
-      std::memory_order_relaxed);
-  m_fifo.bFF_LoWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark),
-      std::memory_order_relaxed);
-
-  bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
-               m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
-  bool ovfInt = m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) &&
-                m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
-  bool undfInt = m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) &&
-                 m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
-
-  bool interrupt = (bpInt || ovfInt || undfInt) && m_cp_ctrl_reg.GPReadEnable;
+  const bool interrupt = ComputeFifoInterrupt();
 
   if (interrupt != m_interrupt_set.IsSet() && !m_interrupt_waiting.IsSet())
   {
     const u64 userdata = interrupt ? 1 : 0;
     if (IsOnThread(m_system))
     {
-      if (!interrupt || bpInt || undfInt || ovfInt)
-      {
-        m_interrupt_set.Set(interrupt);
-        DEBUG_LOG_FMT(COMMANDPROCESSOR, "Interrupt set");
-        m_system.GetProcessorInterface().SetInterrupt(INT_CAUSE_CP, interrupt);
-      }
+      m_interrupt_set.Set(interrupt);
+      DEBUG_LOG_FMT(COMMANDPROCESSOR, "Interrupt set");
+      m_system.GetProcessorInterface().SetInterrupt(INT_CAUSE_CP, interrupt);
     }
     else
     {
@@ -551,6 +589,10 @@ void CommandProcessorManager::SetCPStatusFromCPU()
 
 void CommandProcessorManager::SetCpStatusRegister()
 {
+  // The guest is about to observe the FIFO: publish every block sitting in the
+  // pipe first, so ReadIdle / the watermark bits describe reality.
+  FlushPendingGatherPipe();
+
   // Here always there is one fifo attached to the GPU
   m_cp_status_reg.Breakpoint = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed);
   m_cp_status_reg.ReadIdle = !m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) ||
@@ -559,8 +601,10 @@ void CommandProcessorManager::SetCpStatusRegister()
   m_cp_status_reg.CommandIdle = !m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) ||
                                 Fifo::AtBreakpoint(m_system) ||
                                 !m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed);
-  m_cp_status_reg.UnderflowLoWatermark = m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed);
-  m_cp_status_reg.OverflowHiWatermark = m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed);
+  m_cp_status_reg.UnderflowLoWatermark =
+      m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark;
+  m_cp_status_reg.OverflowHiWatermark =
+      m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark;
 
   DEBUG_LOG_FMT(COMMANDPROCESSOR, "\t Read from STATUS_REGISTER : {:04x}", m_cp_status_reg.Hex);
   DEBUG_LOG_FMT(COMMANDPROCESSOR,
@@ -573,6 +617,9 @@ void CommandProcessorManager::SetCpStatusRegister()
 
 void CommandProcessorManager::SetCpControlRegister()
 {
+  // A control change may unlink the pipe: never carry unpublished blocks across.
+  FlushPendingGatherPipe();
+
   // Just before disabling reads, give the GPU a chance to catch up.
   if (m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) && !m_cp_ctrl_reg.GPReadEnable)
   {
@@ -584,6 +631,7 @@ void CommandProcessorManager::SetCpControlRegister()
   m_fifo.bFF_HiWatermarkInt.store(m_cp_ctrl_reg.FifoOverflowIntEnable, std::memory_order_relaxed);
   m_fifo.bFF_LoWatermarkInt.store(m_cp_ctrl_reg.FifoUnderflowIntEnable, std::memory_order_relaxed);
   m_fifo.bFF_GPLinkEnable.store(m_cp_ctrl_reg.GPLinkEnable, std::memory_order_relaxed);
+  RefreshFifoInterruptFlag();
 
   DEBUG_LOG_FMT(COMMANDPROCESSOR, "\t GPREAD {} | BP {} | Int {} | OvF {} | UndF {} | LINK {}",
                 m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? "ON" : "OFF",
@@ -602,6 +650,9 @@ void CommandProcessorManager::SetCpClearRegister()
 
 void CommandProcessorManager::ResetFifo()
 {
+  // Pending publishes belong to the old FIFO; account for them before it moves.
+  FlushPendingGatherPipe();
+
   // Link fifos, disable interrupts, disable reads.
   m_cp_ctrl_reg.Hex = 0x0010;
   SetCpControlRegister();

@@ -28,13 +28,36 @@ bool PulseAudio::Init()
   m_run_thread.Set();
   m_thread = std::thread(&PulseAudio::SoundLoop, this);
 
+  // PulseInit publishes the main loop as its very first statement, long before
+  // it blocks on the server, so waiting for it is a pointer hand-off rather
+  // than a connection wait. It has to be published before Init returns,
+  // otherwise ~PulseAudio would have no handle to interrupt the loop's poll.
+  while (m_pa_ml.load(std::memory_order_acquire) == nullptr)
+    std::this_thread::yield();
+
   return true;
 }
 
 PulseAudio::~PulseAudio()
 {
   m_run_thread.Clear();
+  // SoundLoop sits in pa_mainloop_iterate(block=1) and only re-checks the run
+  // flag when the server sends something. While emulation is paused -- the
+  // settings menu pauses it, so a backend change happens precisely in that
+  // state -- no audio is written and the sink falls silent, so no event need
+  // ever arrive. Without this wakeup the join() below waits for a server event
+  // that may never come: measured at 17 s, during which the whole UI is frozen
+  // because the caller is the thread that draws the menu.
+  if (pa_mainloop* loop = m_pa_ml.load(std::memory_order_acquire))
+    pa_mainloop_wakeup(loop);
   m_thread.join();
+  // The loop outlives the thread on purpose: the wakeup above races the
+  // thread's own exit, so freeing it on that thread would leave this one
+  // poking at freed memory. Nothing is left on the loop by now (PulseShutdown
+  // disconnects the context before the thread ends), so freeing it here is
+  // just resource release.
+  if (pa_mainloop* loop = m_pa_ml.exchange(nullptr))
+    pa_mainloop_free(loop);
 }
 
 // Called on audio thread.
@@ -136,7 +159,9 @@ void PulseAudio::PulseShutdown()
 {
   pa_context_disconnect(m_pa_ctx);
   pa_context_unref(m_pa_ctx);
-  pa_mainloop_free(m_pa_ml);
+  // pa_mainloop_free() deliberately happens in the destructor, after this
+  // thread has finished: the destructor wakes the loop from another thread and
+  // must not do so against a freed object.
 }
 
 void PulseAudio::StateCallback(pa_context* c)

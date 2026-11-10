@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
@@ -25,6 +28,7 @@
 #include "Core/CoreTiming.h"
 #include "Core/FifoPlayer/FifoPlayer.h"
 #include "Core/HW/MMIO.h"
+#include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/SI/SI.h"
 #include "Core/HW/SystemTimers.h"
@@ -624,6 +628,106 @@ void VideoInterfaceManager::OutputField(FieldType field, u64 ticks)
         xfbAddr)
     {
       xfbAddr -= fbStride;
+    }
+  }
+
+  // MODERNGEKKO_VI_DEBUG=1 reports the VI output configuration once per second.
+  // LogField() below uses DEBUG_LOG_FMT, which a release build compiles out, so
+  // otherwise there is no way to tell whether the picture on screen is one field
+  // or two stitched ones. That difference decides whether the picture can comb
+  // and flicker on vertical detail, so it is worth being able to read it.
+  {
+    static const int vi_debug_level = [] {
+      const char* value = std::getenv("MODERNGEKKO_VI_DEBUG");
+      return value ? std::atoi(value) : 0;
+    }();
+    if (vi_debug_level >= 1)
+    {
+      static auto last_report = std::chrono::steady_clock::time_point{};
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_report >= std::chrono::seconds(1))
+      {
+        last_report = now;
+        std::fprintf(stderr,
+                     "[vi] field=%s addr=%08x top=%08x bottom=%08x prb_even=%u prb_odd=%u "
+                     "WPL=%u STD=%u ACV=%u interlaced_xfb=%d "
+                     "interlaced_mode=%d force_progressive=%d halflines_even=%u "
+                     "stride=%u width=%u height=%u\n",
+                     field == FieldType::Even ? "even" : "odd", xfbAddr, GetXFBAddressTop(),
+                     GetXFBAddressBottom(), static_cast<unsigned>(m_vblank_timing_even.PRB),
+                     static_cast<unsigned>(m_vblank_timing_odd.PRB),
+                     static_cast<unsigned>(m_picture_configuration.WPL),
+                     static_cast<unsigned>(m_picture_configuration.STD),
+                     static_cast<unsigned>(m_vertical_timing_register.ACV),
+                     potentially_interlaced_xfb ? 1 : 0, interlaced_video_mode ? 1 : 0,
+                     Config::Get(Config::GFX_HACK_FORCE_PROGRESSIVE) ? 1 : 0,
+                     GetHalfLinesPerEvenField(), fbStride, fbWidth, fbHeight);
+        std::fflush(stderr);
+      }
+    }
+  }
+
+  // MODERNGEKKO_VI_DEBUG=2 additionally hashes the pixels this present is about
+  // to read, one line per present. The register dump above cannot answer the
+  // question that matters for flicker: are the two halves of a stitched frame
+  // the same picture (the weave is correct) or two different points in time (the
+  // weave combs, and does so 50 times a second)? Identical hashes on consecutive
+  // presents instead mean a stale XFB read, which looks the same on screen.
+  {
+    static const int vi_debug_level = [] {
+      const char* value = std::getenv("MODERNGEKKO_VI_DEBUG");
+      return value ? std::atoi(value) : 0;
+    }();
+    if (vi_debug_level >= 2 && xfbAddr != 0 && fbHeight > 0 && fbStride > 0)
+    {
+      static u64 seq = 0;
+      u64 hash = 0xcbf29ce484222325ULL;
+      bool readable = true;
+      for (u32 row = 0; row < fbHeight; ++row)
+      {
+        const u8* row_data =
+            m_system.GetMemory().GetPointerForRange(xfbAddr + row * fbStride, fbStride);
+        if (!row_data)
+        {
+          readable = false;
+          break;
+        }
+        for (u32 i = 0; i < fbStride; ++i)
+        {
+          hash = (hash ^ row_data[i]) * 0x100000001b3ULL;
+        }
+      }
+      std::fprintf(stderr, "[vi2] seq=%llu field=%s addr=%08x w=%u h=%u stride=%u hash=%016llx ok=%d\n",
+                   static_cast<unsigned long long>(seq++), field == FieldType::Even ? "even" : "odd",
+                   xfbAddr, fbWidth, fbHeight, fbStride, static_cast<unsigned long long>(hash),
+                   readable ? 1 : 0);
+      std::fflush(stderr);
+
+      // MODERNGEKKO_VI_DUMP=<dir> writes every 100th present as a greyscale PGM
+      // (Y plane of the YUY2 XFB). Being able to look at what the emulator is
+      // told to present settles "is this a stale XFB or a genuine static frame"
+      // far faster than reading numbers.
+      static const char* const dump_dir = std::getenv("MODERNGEKKO_VI_DUMP");
+      if (dump_dir && readable && (seq % 100) == 0)
+      {
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/xfb-%05llu.pgm", dump_dir,
+                      static_cast<unsigned long long>(seq));
+        if (FILE* const file = std::fopen(path, "wb"))
+        {
+          std::fprintf(file, "P5\n%u %u\n255\n", fbWidth, fbHeight);
+          for (u32 row = 0; row < fbHeight; ++row)
+          {
+            const u8* row_data =
+                m_system.GetMemory().GetPointerForRange(xfbAddr + row * fbStride, fbStride);
+            if (!row_data)
+              break;
+            for (u32 x = 0; x < fbWidth; ++x)
+              std::fputc(row_data[x * 2], file);
+          }
+          std::fclose(file);
+        }
+      }
     }
   }
 

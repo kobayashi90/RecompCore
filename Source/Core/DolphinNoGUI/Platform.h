@@ -25,6 +25,13 @@ public:
 
   virtual WindowSystemInfo GetWindowSystemInfo() const = 0;
 
+  // Requests a live change of the window's fullscreen state. Platforms that
+  // own a toplevel must apply this on their own event thread (Wayland proxies
+  // are not safe to request changes from arbitrary threads), so this only
+  // records+forwards the request; the default implementation is a no-op for
+  // platforms with no notion of fullscreen (headless).
+  virtual void RequestFullscreenChange(bool fullscreen);
+
   // Requests a graceful shutdown, from SIGINT/SIGTERM.
   void RequestShutdown();
 

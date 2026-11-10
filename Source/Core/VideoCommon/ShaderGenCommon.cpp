@@ -51,8 +51,15 @@ ShaderHostConfig ShaderHostConfig::GetCurrent()
 std::string GetDiskShaderCacheFileName(APIType api_type, const char* type, bool include_gameid,
                                        bool include_host_config, bool include_api)
 {
+  // CreateDirs, not CreateDir: the shader cache lives under the user directory's
+  // Cache/Shaders/, and a user directory that has never held a cache has no
+  // Cache/ to put Shaders/ in. A non-recursive create fails there, the failure
+  // is only an ERROR_LOG_FMT (compiled out of release builds), and the cache
+  // write then lands nowhere -- which is invisible until you notice that every
+  // session recompiles every pipeline from scratch and hitches at each scene
+  // transition.
   if (!File::Exists(File::GetUserPath(D_SHADERCACHE_IDX)))
-    File::CreateDir(File::GetUserPath(D_SHADERCACHE_IDX));
+    File::CreateDirs(File::GetUserPath(D_SHADERCACHE_IDX));
 
   std::string filename = File::GetUserPath(D_SHADERCACHE_IDX);
   if (include_api)

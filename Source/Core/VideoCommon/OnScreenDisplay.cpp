@@ -55,6 +55,8 @@ struct Message
 };
 static std::multimap<MessageType, Message> s_messages;
 static std::mutex s_messages_mutex;
+// Optional frontend hook (see SetMessageFilter). Guarded by s_messages_mutex.
+static MessageFilter s_message_filter;
 
 static ImVec4 ARGBToImVec4(const u32 argb)
 {
@@ -149,7 +151,15 @@ void AddMessage(std::string message, u32 ms, u32 argb,
                 const VideoCommon::CustomTextureData::ArraySlice::Level* icon)
 {
   std::lock_guard lock{s_messages_mutex};
+  if (s_message_filter && s_message_filter(message))
+    return;
   s_messages.emplace(MessageType::Typeless, Message(std::move(message), ms, argb, icon));
+}
+
+void SetMessageFilter(MessageFilter filter)
+{
+  std::lock_guard lock{s_messages_mutex};
+  s_message_filter = std::move(filter);
 }
 
 void DrawMessages()

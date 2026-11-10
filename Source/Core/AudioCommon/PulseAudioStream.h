@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #if defined(HAVE_PULSEAUDIO) && HAVE_PULSEAUDIO
 #include <pulse/pulseaudio.h>
 #endif
@@ -45,7 +47,10 @@ private:
 
   int m_pa_error;
   int m_pa_connected;
-  pa_mainloop* m_pa_ml;
+  // Owned by the loop thread but kept here so ~PulseAudio can interrupt its
+  // blocking poll. It is freed by the destructor after the thread has joined,
+  // which is why it is atomic: the destructor reads it while the thread runs.
+  std::atomic<pa_mainloop*> m_pa_ml{nullptr};
   pa_mainloop_api* m_pa_mlapi;
   pa_context* m_pa_ctx;
   pa_stream* m_pa_s;

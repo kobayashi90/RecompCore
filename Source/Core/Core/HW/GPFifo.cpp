@@ -88,8 +88,15 @@ void GPFifoManager::UpdateGatherPipe()
   auto& memory = system.GetMemory();
   auto& processor_interface = system.GetProcessorInterface();
 
+  auto& command_processor = system.GetCommandProcessor();
+
+  // Note: processor_interface.m_fifo_cpu_base/end/write_pointer are the guest's
+  // own FIFO pointers (PI_FIFO_BASE/END/WPTR are direct MMIO writes to them) and
+  // stay authoritative throughout -- never re-derive them from the CP registers,
+  // which the guest also writes, at different moments.
   size_t pipe_count = GetGatherPipeCount();
   size_t processed;
+  u32 blocks = 0;
   for (processed = 0; pipe_count >= GATHER_PIPE_SIZE; processed += GATHER_PIPE_SIZE)
   {
     // copy the GatherPipe
@@ -103,8 +110,14 @@ void GPFifoManager::UpdateGatherPipe()
     else
       processor_interface.m_fifo_cpu_write_pointer += GATHER_PIPE_SIZE;
 
-    system.GetCommandProcessor().GatherPipeBursted();
+    ++blocks;
   }
+
+  // One call for the whole drain: the per-block FIFO bookkeeping (two locked
+  // read-modify-writes on the cache line the video thread is reading, the
+  // interrupt recomputation and the GPU wakeup) is coalesced inside.
+  if (blocks != 0)
+    command_processor.GatherPipeBursted(blocks);
 
   // move back the spill bytes
   memmove(m_gather_pipe, m_gather_pipe + processed, pipe_count);

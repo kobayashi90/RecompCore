@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@ class NativeVertexFormat;
 class AbstractTexture;
 class AbstractPipeline;
 struct ImTextureData;
+struct ImGuiContext;
 
 namespace VideoCommon
 {
@@ -32,7 +34,10 @@ public:
   // Returns a lock for the ImGui mutex, enabling data structures to be modified from outside.
   // Use with care, only non-drawing functions should be called from outside the video thread,
   // as the drawing is tied to a "frame".
-  std::unique_lock<std::mutex> GetImGuiLock();
+  // The mutex is process-wide (static): ImGui's current context is a single global, so every
+  // ImGui user in this process (OSD, settings menu, ...) must serialize through this lock and
+  // call ImGui::SetCurrentContext() with its own context after acquiring it.
+  static std::unique_lock<std::mutex> GetImGuiLock();
 
   bool IsReady() { return m_ready; }
 
@@ -54,11 +59,23 @@ public:
 
   void Finalize();
 
+  // Overlay draw hook: invoked from Finalize() between the OSD's own windows
+  // and ImGui::Render(), with this context current and the ImGui lock held —
+  // i.e. inside the game window's frame. Used by the frontend settings menu
+  // so it renders in the game window instead of a second SDL window.
+  // Registering/clearing must happen while no video thread is presenting
+  // (before Runtime::Run() / after it returned).
+  static void SetOverlayDrawHook(std::function<void()> hook);
+
   // Receive keyboard and mouse from QT
   void SetKeyMap(const DolphinKeyMap& key_map);
   void SetKey(u32 key, bool is_down, const char* chars);
+  // Raw xkb/X11 keysym feed (the Wayland platform layer has no Qt-style key
+  // map); maps to ImGuiKey and queues the event.
+  void SetKeysym(u32 keysym, bool is_down);
   void SetMousePos(float x, float y);
   void SetMousePress(u32 button_mask);
+  void SetMouseWheel(float x, float y);
 
 private:
   void DrawDebugText();
@@ -70,7 +87,9 @@ private:
   std::vector<std::unique_ptr<AbstractTexture>> m_imgui_textures;
   std::unique_ptr<AbstractPipeline> m_imgui_pipeline;
   std::map<u32, int> m_dolphin_to_imgui_map;
-  std::mutex m_imgui_mutex;
+  static std::mutex m_imgui_mutex;
+  static std::function<void()> s_overlay_hook;
+  ImGuiContext* m_imgui_context = nullptr;
   u64 m_imgui_last_frame_time = 0;
 
   u32 m_backbuffer_width = 1;

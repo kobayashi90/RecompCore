@@ -68,6 +68,9 @@ bool ObjectCache::Initialize()
 
 void ObjectCache::Shutdown()
 {
+  std::fprintf(stderr, "[diag] object cache shutdown: shader_cache=%d handle=%d file=%s\n",
+               g_ActiveConfig.bShaderCache ? 1 : 0, m_pipeline_cache != VK_NULL_HANDLE ? 1 : 0,
+               m_pipeline_cache_filename.c_str());
   if (g_ActiveConfig.bShaderCache && m_pipeline_cache != VK_NULL_HANDLE)
     SavePipelineCache();
 }
@@ -654,6 +657,7 @@ void ObjectCache::DestroyPipelineCache()
 
 void ObjectCache::SavePipelineCache()
 {
+  std::fprintf(stderr, "[diag] saving pipeline cache to %s\n", m_pipeline_cache_filename.c_str());
   size_t data_size;
   VkResult res =
       vkGetPipelineCacheData(g_vulkan_context->GetDevice(), m_pipeline_cache, &data_size, nullptr);

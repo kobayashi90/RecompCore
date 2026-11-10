@@ -4,6 +4,10 @@
 #include "AudioCommon/Mixer.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <span>
@@ -60,6 +64,46 @@ void Mixer::DoState(PointerWrap& p)
     mixer.DoState(p);
 }
 
+// Audio-drift counters. Both of the recovery paths below are silent, and they
+// mean opposite things: a too-long queue means the DSP produced audio faster
+// than the output stream consumed it (the playhead jumps forward, which you
+// hear as the soundtrack rushing/skipping), while an empty queue means the
+// producer could not keep up (silence or looping). Counting them turns "audio
+// sounds too fast" into a number. Printed once a second from the sound thread.
+namespace
+{
+std::atomic<u64> s_audio_overruns{0};
+std::atomic<u64> s_audio_underruns{0};
+std::atomic<int> s_audio_in_rate{0};
+std::atomic<int> s_audio_out_rate{0};
+std::atomic<int> s_audio_queue_target{0};
+std::atomic<int> s_audio_queue_len{0};
+void ReportAudioDrift()
+{
+  // Off by default: once audio is healthy this is pure noise in the log.
+  // MODERNGEKKO_AUDIO_DEBUG=1 turns the once-a-second report back on.
+  static const bool enabled = [] {
+    const char* value = std::getenv("MODERNGEKKO_AUDIO_DEBUG");
+    return value && *value == '1';
+  }();
+  if (!enabled)
+    return;
+  static auto last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last);
+  if (elapsed.count() < 1000)
+    return;
+  last = now;
+  std::fprintf(stderr,
+               "[audio] overruns=%llu underruns=%llu in=%d out=%d target=%d queued=%d (1s)\n",
+               static_cast<unsigned long long>(s_audio_overruns.exchange(0)),
+               static_cast<unsigned long long>(s_audio_underruns.exchange(0)),
+               s_audio_in_rate.load(), s_audio_out_rate.load(),
+               s_audio_queue_target.load(), s_audio_queue_len.load());
+  std::fflush(stderr);
+}
+}  // namespace
+
 // Executed from sound stream thread
 void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
 {
@@ -97,6 +141,15 @@ void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
   bool fade_audio = m_queue_fading.load(std::memory_order_relaxed);
 
   m_granule_queue_size.store(buffer_size_granules, std::memory_order_relaxed);
+  if (m_ever_pushed)
+  {
+    s_audio_in_rate.store(static_cast<int>(in_sample_rate));
+    s_audio_out_rate.store(static_cast<int>(out_sample_rate));
+    s_audio_queue_target.store(static_cast<int>(buffer_size_granules));
+    s_audio_queue_len.store(static_cast<int>((m_queue_head.load(std::memory_order_relaxed) -
+                                              m_queue_tail.load(std::memory_order_relaxed)) &
+                                             GRANULE_QUEUE_MASK));
+  }
 
   while (num_samples-- > 0)
   {
@@ -550,6 +603,7 @@ void Mixer::MixerFifo::Enqueue()
   m_queue_looping.store(false, std::memory_order_relaxed);
 }
 
+
 bool Mixer::MixerFifo::Dequeue(Granule* granule)
 {
   const std::size_t granule_queue_size = m_granule_queue_size.load(std::memory_order_relaxed);
@@ -562,6 +616,11 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
     // Jump the playhead to half the queue size behind the head.
     const std::size_t gap = (granule_queue_size >> 1) + 1;
     tail = (head - gap) & GRANULE_QUEUE_MASK;
+    if (m_ever_pushed)
+    {
+      s_audio_overruns.fetch_add(1, std::memory_order_relaxed);
+      ReportAudioDrift();
+    }
   }
 
   // Checks to see if the queue is empty.
@@ -580,12 +639,22 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
       bool looping = m_queue_looping.load(std::memory_order_relaxed);
       m_queue_fading.store(looping, std::memory_order_relaxed);
       m_queue_looping.store(true, std::memory_order_relaxed);
+      if (m_ever_pushed)
+      {
+        s_audio_underruns.fetch_add(1, std::memory_order_relaxed);
+        ReportAudioDrift();
+      }
     }
     else
     {
       std::fill(granule->begin(), granule->end(), StereoPair{0.0f, 0.0f});
       m_queue_fading.store(false, std::memory_order_relaxed);
       m_queue_looping.store(false, std::memory_order_relaxed);
+      if (m_ever_pushed)
+      {
+        s_audio_underruns.fetch_add(1, std::memory_order_relaxed);
+        ReportAudioDrift();
+      }
       return false;
     }
   }

@@ -9,10 +9,13 @@ extern "C" {
 // more msvc shit fuck msvc
 #if defined(_MSC_VER)
 #define GXRUNTIME_ALWAYS_INLINE __forceinline
+#define GXRUNTIME_UNLIKELY(x) (x)
 #elif defined(__GNUC__) || defined(__clang__)
 #define GXRUNTIME_ALWAYS_INLINE inline __attribute__((always_inline))
+#define GXRUNTIME_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
 #define GXRUNTIME_ALWAYS_INLINE inline
+#define GXRUNTIME_UNLIKELY(x) (x)
 #endif
 
 // Minimal CPU support ABI for generated code and CPU tests.
@@ -34,7 +37,14 @@ extern "C" {
 //   field DolRecomp added to its generated-code CPUState in f0a86be. The
 //   prefix is shared with generated code, so the field must sit at the same
 //   offset on both sides; hosts that do not meter guest time may ignore it.
-#define GXRUNTIME_CPU_ABI_VERSION 4u
+// - ABI v5 adds gather-pipe inline staging at the tail: gather_pipe_base +
+//   gather_pipe_cursor + gather_flush. The module stages write-gather-pipe
+//   stores (effective 0xCC008000 page) straight into GPFifo's staging buffer
+//   through the host's live cursor and only calls the host when a 32-byte
+//   block fills -- the module-side twin of Dolphin's optimizeGatherPipe.
+//   Tail append; base NULL (lockstep journaling, legacy hosts) disables the
+//   path and every store falls back to the external_write hook as before.
+#define GXRUNTIME_CPU_ABI_VERSION 5u
 #define GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX 1u
 #define GXRUNTIME_CPU_ABI_EXTERNAL_POINTER_EXTENSION 1u
 
@@ -103,6 +113,12 @@ typedef bool (*PPCHostCall)(CPUState* cpu, u32 address);
 typedef u32 (*PPCSPRRead)(CPUState* cpu, u16 spr, u32 cia);
 typedef void (*PPCSPRWrite)(CPUState* cpu, u16 spr, u32 value, u32 cia);
 typedef void (*PPCCacheControl)(CPUState* cpu, u8 operation, u32 ea, u32 cia);
+/* Host-side drain for gather-pipe staging (ABI v5): called by the module once
+ * a staged block reaches GATHER_PIPE_SIZE. Must behave exactly like
+ * GPFifoManager::Write32's tail (CheckGatherPipe: copy full 32-byte blocks to
+ * emulated memory, memmove the spill back). Only ever reached when
+ * gather_pipe_base is non-NULL, so the host publishes both together. */
+typedef void (*PPCGatherFlush)(CPUState* cpu);
 
 enum {
     PPC_CACHE_DCBST,
@@ -163,6 +179,45 @@ struct CPUState {
     PPCSPRRead spr_read;
     PPCSPRWrite spr_write;
     PPCCacheControl cache_control;
+    // Locked-L1 direct window (appended fields; desc->cpu_state_size gates
+    // stale modules). NULL while lockstep journaling is active so L1 stores
+    // stay on the MMU path (StaticRecompCore::Run sets these).
+    u8* l1_cache;
+    u32 l1_cache_size;
+
+    // Identity-mapped locked-L1 window (one page at a time).
+    //
+    // ReadFromHardware/WriteToHardware serve segment 0xE out of the locked
+    // cache buffer at (ea & 0x0FFFFFFF), but only after TranslateAddress. With
+    // MSR.DR set that translation costs a BAT/TLB lookup per access, and the
+    // host hook costs a full round trip on top; a GameCube game can issue
+    // millions of these per second (6M/s in beach spikers' audio ring).
+    //
+    // The host publishes one page only after proving that TranslateAddress is
+    // the identity across that whole page, and records the guest MSR it
+    // validated under. get_ram_ptr then serves those accesses inline: l1_win_page
+    // is the effective page (addr >> 12), l1_win_host points at the matching
+    // spot in the locked-cache buffer, and l1_win_msr is the MSR snapshot --
+    // mtmsr is emitted inline, so an MSR change disables the window on the very
+    // next access instead of serving a stale mapping. BAT/TLB/HID writes go
+    // through the fallback hook, which clears the window (host republishes on
+    // the next locked-cache access). Null while lockstep journaling is on.
+    u8* l1_win_host;
+    u32 l1_win_page;
+    u32 l1_win_msr;
+    /* Write-gather-pipe staging (ABI v5 tail append: no existing field
+     * shifts). The module writes pipe stores into GPFifo's own staging
+     * buffer through gather_cursor (which points at the host's live
+     * PPCState.gather_pipe_ptr, so the host's byte count is current at every
+     * instant -- no publish discipline on either side), and calls
+     * gather_flush once a GATHER_PIPE_SIZE block has filled. base is the
+     * buffer base (GPFifo's m_gather_pipe) and is NULL while lockstep
+     * journaling is active, which disables the whole path so the hooks keep
+     * owning journaling. Hosts that do not stage leave all three NULL/zero.
+     * Keep byte-identical with ModernGekko's include/moderngekko/cpu_state.h. */
+    u8* gather_pipe_base;
+    u8** gather_pipe_cursor;
+    PPCGatherFlush gather_flush;
 };
 
 #include <stdio.h>
@@ -173,23 +228,61 @@ extern void* g_mem_write_journal_user;
 
 static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size, u32* out_offset) {
     u32 masked_addr = addr & ~0x40000000u;
-    
-    // Check MEM2 (EXRAM) first as it is much more common in Wii titles
+
+    // Check MEM1 first with the miss marked unlikely so the hot continuation
+    // stays the fall-through path. GCC statically predicts forward
+    // conditional jumps as not-taken; the old exram-first / success-as-THEN
+    // shape sank the common path's pointer resolution ~325KB away from its
+    // range check, costing two long jumps and two cold i-cache lines on
+    // every RAM access.
+    u32 offset = masked_addr - 0x80000000u;
+    if (GXRUNTIME_UNLIKELY(offset > cpu->ram_size - size))
+        goto slow;
+    if (out_offset) *out_offset = offset;
+    return cpu->ram + offset;
+
+slow:
+    // Check MEM2 (EXRAM) as it is much more common in Wii titles
     if (cpu->exram) {
-        u32 offset = masked_addr - 0x90000000u;
-        if (offset <= cpu->exram_size - size) {
+        u32 exram_offset = masked_addr - 0x90000000u;
+        if (exram_offset <= cpu->exram_size - size) {
             if (out_offset) *out_offset = (u32)-1;
-            return cpu->exram + offset;
+            return cpu->exram + exram_offset;
         }
     }
-    
-    // Check MEM1
-    u32 offset = masked_addr - 0x80000000u;
-    if (offset <= cpu->ram_size - size) {
-        if (out_offset) *out_offset = offset;
-        return cpu->ram + offset;
+
+    // Identity-mapped locked L1 (segment 0xE): served inline once the host has
+    // proven this page's translation is the identity. The page check keeps the
+    // fast path off any page the host has not validated; an access straddling
+    // the page boundary stays on the hook path because the hardware splits it
+    // byte-wise before translating.
+    if (cpu->l1_win_host && (addr >> 12) == cpu->l1_win_page && cpu->msr == cpu->l1_win_msr) {
+        u32 in_page = addr & 0xFFFu;
+        if (in_page + size <= 0x1000u) {
+            if (out_offset) *out_offset = (u32)-1;
+            return cpu->l1_win_host + in_page;
+        }
     }
-    
+
+    // Locked/mirror window: ask the host for the exact bytes the MMU would
+    // touch. Whether effective 0xE0000000 lands on the locked L1 buffer
+    // depends on live MSR.DR + BAT/TLB state, so the host translates per
+    // access -- an assumed-identity direct window silently splits module
+    // and host views (the module writes a shadow buffer the host never
+    // reads) and stalls the game. NULL = no direct mapping (MMIO, faults,
+    // cross-page splits, lockstep journaling) -> fall back to the
+    // per-access MMU hooks, which reproduce hardware exactly. Only raw
+    // E-window EAs are asked; everything else keeps the old hook path.
+    // offset=(u32)-1 marks "not MEM1" so the RAM write journal never fires
+    // for this window (the host hooks own journaling).
+    if ((addr >> 28) == 0xE && cpu->external_pointer) {
+        u8* p = (u8*)cpu->external_pointer(cpu, addr, size);
+        if (p) {
+            if (out_offset) *out_offset = (u32)-1;
+            return p;
+        }
+    }
+
     return NULL;
 }
 
@@ -198,6 +291,45 @@ static GXRUNTIME_ALWAYS_INLINE void clear_matching_reservation(CPUState* cpu, u3
     u32 store_addr = addr & ~0x40000000u;
     if (cpu->reserve_valid && ((reserve_addr ^ store_addr) & ~31u) == 0)
         cpu->reserve_valid = false;
+}
+
+/* GPFifo's staging granularity, mirroring GPFifo::GATHER_PIPE_SIZE in the
+ * Dolphin chassis (Core/HW/GPFifo.h). The staging buffer itself is 16x this. */
+#define GXRUNTIME_GATHER_PIPE_SIZE 32u
+
+/* Write-gather-pipe fast path (ABI v5): a store to the pipe page appends to
+ * GPFifo's staging buffer in place and calls the host only when a full
+ * GXRUNTIME_GATHER_PIPE_SIZE block has accumulated -- the module-side twin of
+ * Dolphin's optimizeGatherPipe. It replaces the per-store resolve miss +
+ * external_write host call + GPFifoManager::Write32 round trip that used to
+ * service every display-list write. Byte order matches GPFifo::FastWrite*:
+ * big-endian bytes in the pipe. The cursor points at the host's live
+ * PPCState.gather_pipe_ptr, so a host that drains the pipe concurrently (it
+ * cannot: same thread) or between stores always sees the true count. Returns
+ * false when the host published no buffer (lockstep journaling -- the hooks
+ * own journaling then -- or a legacy host) or addr is not the pipe page, and
+ * the caller falls back to the historical hook path unchanged. */
+static GXRUNTIME_ALWAYS_INLINE bool gather_pipe_store(CPUState* cpu, u32 addr,
+                                                      u64 value, u32 size) {
+    if ((addr & 0xFFFFF000u) != 0xCC008000u || cpu->gather_pipe_base == NULL)
+        return false;
+    u8* p = *cpu->gather_pipe_cursor;
+    if (size == 1) {
+        *p = (u8)value;
+    } else if (size == 2) {
+        u16 v = bswap16((u16)value);
+        memcpy(p, &v, 2);
+    } else if (size == 4) {
+        u32 v = bswap32((u32)value);
+        memcpy(p, &v, 4);
+    } else {
+        u64 v = bswap64(value);
+        memcpy(p, &v, 8);
+    }
+    *cpu->gather_pipe_cursor = p + size;
+    if ((p + size) - cpu->gather_pipe_base >= GXRUNTIME_GATHER_PIPE_SIZE)
+        cpu->gather_flush(cpu);
+    return true;
 }
 
 static GXRUNTIME_ALWAYS_INLINE u64 mem_read64(CPUState* cpu, u32 addr) {
@@ -211,6 +343,7 @@ static GXRUNTIME_ALWAYS_INLINE u64 mem_read64(CPUState* cpu, u32 addr) {
 }
 
 static GXRUNTIME_ALWAYS_INLINE void mem_write64(CPUState* cpu, u32 addr, u64 value) {
+    if (gather_pipe_store(cpu, addr, value, 8)) return;
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 8, &offset);
     if (ptr == NULL) {
@@ -235,6 +368,7 @@ static GXRUNTIME_ALWAYS_INLINE u32 mem_read32(CPUState* cpu, u32 addr) {
 }
 
 static GXRUNTIME_ALWAYS_INLINE void mem_write32(CPUState* cpu, u32 addr, u32 value) {
+    if (gather_pipe_store(cpu, addr, value, 4)) return;
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 4, &offset);
     if (ptr == NULL) {
@@ -259,6 +393,7 @@ static GXRUNTIME_ALWAYS_INLINE u16 mem_read16(CPUState* cpu, u32 addr) {
 }
 
 static GXRUNTIME_ALWAYS_INLINE void mem_write16(CPUState* cpu, u32 addr, u16 value) {
+    if (gather_pipe_store(cpu, addr, value, 2)) return;
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 2, &offset);
     if (ptr == NULL) {
@@ -283,6 +418,7 @@ static GXRUNTIME_ALWAYS_INLINE u8 mem_read8(CPUState* cpu, u32 addr) {
 }
 
 static GXRUNTIME_ALWAYS_INLINE void mem_write8(CPUState* cpu, u32 addr, u8 value) {
+    if (gather_pipe_store(cpu, addr, value, 1)) return;
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 1, &offset);
     if (ptr == NULL) {
@@ -403,6 +539,7 @@ static inline bool ppc_fp_available_inline(CPUState* cpu, u32 cia) {
     return ppc_fp_raise_unavailable(cpu, cia);
 }
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
+void ppc_entry_miss(u32 pc);
 bool ppc_host_call(CPUState* cpu, u32 address);
 void ppc_system_call_exception(CPUState* cpu, u32 cia);
 void ppc_dsi_exception(CPUState* cpu, u32 ea, u32 cia, u32 dsisr);

@@ -16,7 +16,10 @@ static constexpr auto X_None = None;
 #include "Core/Core.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "moderngekko/hotkey.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -90,6 +93,32 @@ bool PlatformX11::Init()
   m_window = XCreateSimpleWindow(m_display, DefaultRootWindow(m_display), m_window_x, m_window_y,
                                  m_window_width, m_window_height, 0, 0, BlackPixel(m_display, 0));
   XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask);
+  // The Wayland backend names its toplevel from MODERNGEKKO_APP_ID so the
+  // compositor can match the window to the launcher's .desktop file, and
+  // therefore to its icon. X11 does the same job with WM_CLASS, which nothing
+  // set here: the taskbar entry fell back to the executable name, so a build
+  // that introduces itself as the game still showed "moderngekko-run" in the
+  // window list. Both fields get the app id; a .desktop file matches on the
+  // class name, which is the second one.
+  {
+    // Compile-time default so a runner started straight from a shell (no
+    // launcher, no MODERNGEKKO_APP_ID in the environment) still identifies as
+    // the game rather than as the emulator.
+#ifndef MODERNGEKKO_DEFAULT_APP_ID
+#define MODERNGEKKO_DEFAULT_APP_ID "org.moderngekko.Runner"
+#endif
+    const char* const app_id_env = std::getenv("MODERNGEKKO_APP_ID");
+    const char* const app_id =
+        (app_id_env && *app_id_env) ? app_id_env : MODERNGEKKO_DEFAULT_APP_ID;
+    // XSetClassHint keeps the pointers it is given, so the storage has to
+    // outlive the call. One window per process, so static is enough.
+    static char class_instance[256];
+    static char class_name[256];
+    std::snprintf(class_instance, sizeof(class_instance), "%s", app_id);
+    std::snprintf(class_name, sizeof(class_name), "%s", app_id);
+    XClassHint class_hint{class_instance, class_name};
+    XSetClassHint(m_display, m_window, &class_hint);
+  }
   Atom wmProtocols[1];
   wmProtocols[0] = XInternAtom(m_display, "WM_DELETE_WINDOW", True);
   XSetWMProtocols(m_display, m_window, wmProtocols, 1);
@@ -192,6 +221,8 @@ void PlatformX11::ProcessEvents()
     {
     case KeyPress:
       key = XLookupKeysym((XKeyEvent*)&event, 0);
+      if (moderngekko::NotifyHotkey(static_cast<unsigned>(key)))
+        break;
       if (key == XK_Escape && (event.xkey.state & ControlMask))
       {
         RequestShutdown();

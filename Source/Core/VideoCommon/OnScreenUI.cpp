@@ -3,6 +3,10 @@
 
 #include "VideoCommon/OnScreenUI.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 #include "Common/CommonPaths.h"
 #include "Common/EnumMap.h"
 #include "Common/FileUtil.h"
@@ -37,8 +41,122 @@
 #include <imgui.h>
 #include <implot.h>
 
+#if defined(__linux__)
+#include <xkbcommon/xkbcommon-keysyms.h>
+#endif
+
 namespace VideoCommon
 {
+std::mutex OnScreenUI::m_imgui_mutex;
+std::function<void()> OnScreenUI::s_overlay_hook;
+
+void OnScreenUI::SetOverlayDrawHook(std::function<void()> hook)
+{
+  std::lock_guard lock(m_imgui_mutex);
+  s_overlay_hook = std::move(hook);
+}
+
+#if defined(__linux__)
+namespace
+{
+ImGuiKey KeysymToImGuiKey(u32 keysym)
+{
+  switch (keysym)
+  {
+  case XKB_KEY_Escape:
+    return ImGuiKey_Escape;
+  case XKB_KEY_Tab:
+  case XKB_KEY_ISO_Left_Tab:
+    return ImGuiKey_Tab;
+  case XKB_KEY_BackSpace:
+    return ImGuiKey_Backspace;
+  case XKB_KEY_Return:
+    return ImGuiKey_Enter;
+  case XKB_KEY_KP_Enter:
+    return ImGuiKey_KeypadEnter;
+  case XKB_KEY_space:
+    return ImGuiKey_Space;
+  case XKB_KEY_Delete:
+    return ImGuiKey_Delete;
+  case XKB_KEY_Insert:
+    return ImGuiKey_Insert;
+  case XKB_KEY_Home:
+    return ImGuiKey_Home;
+  case XKB_KEY_End:
+    return ImGuiKey_End;
+  case XKB_KEY_Page_Up:
+    return ImGuiKey_PageUp;
+  case XKB_KEY_Page_Down:
+    return ImGuiKey_PageDown;
+  case XKB_KEY_Left:
+    return ImGuiKey_LeftArrow;
+  case XKB_KEY_Right:
+    return ImGuiKey_RightArrow;
+  case XKB_KEY_Up:
+    return ImGuiKey_UpArrow;
+  case XKB_KEY_Down:
+    return ImGuiKey_DownArrow;
+  case XKB_KEY_Shift_L:
+  case XKB_KEY_Shift_R:
+    return ImGuiKey_ModShift;
+  case XKB_KEY_Control_L:
+  case XKB_KEY_Control_R:
+    return ImGuiKey_ModCtrl;
+  case XKB_KEY_Alt_L:
+  case XKB_KEY_Alt_R:
+    return ImGuiKey_ModAlt;
+  case XKB_KEY_Super_L:
+  case XKB_KEY_Super_R:
+    return ImGuiKey_ModSuper;
+  case XKB_KEY_Caps_Lock:
+    return ImGuiKey_CapsLock;
+  case XKB_KEY_Num_Lock:
+    return ImGuiKey_NumLock;
+  case XKB_KEY_Print:
+    return ImGuiKey_PrintScreen;
+  case XKB_KEY_Pause:
+    return ImGuiKey_Pause;
+  case XKB_KEY_minus:
+    return ImGuiKey_Minus;
+  case XKB_KEY_equal:
+    return ImGuiKey_Equal;
+  case XKB_KEY_bracketleft:
+    return ImGuiKey_LeftBracket;
+  case XKB_KEY_bracketright:
+    return ImGuiKey_RightBracket;
+  case XKB_KEY_backslash:
+    return ImGuiKey_Backslash;
+  case XKB_KEY_semicolon:
+    return ImGuiKey_Semicolon;
+  case XKB_KEY_apostrophe:
+    return ImGuiKey_Apostrophe;
+  case XKB_KEY_grave:
+    return ImGuiKey_GraveAccent;
+  case XKB_KEY_comma:
+    return ImGuiKey_Comma;
+  case XKB_KEY_period:
+    return ImGuiKey_Period;
+  case XKB_KEY_slash:
+    return ImGuiKey_Slash;
+  default:
+    break;
+  }
+  // Contiguous ranges: F1..F12, a-z, A-Z, 0-9, keypad 0-9.
+  if (keysym >= XKB_KEY_F1 && keysym <= XKB_KEY_F12)
+    return static_cast<ImGuiKey>(ImGuiKey_F1 + (keysym - XKB_KEY_F1));
+  if (keysym >= XKB_KEY_a && keysym <= XKB_KEY_z)
+    return static_cast<ImGuiKey>(ImGuiKey_A + (keysym - XKB_KEY_a));
+  if (keysym >= XKB_KEY_A && keysym <= XKB_KEY_Z)
+    return static_cast<ImGuiKey>(ImGuiKey_A + (keysym - XKB_KEY_A));
+  if (keysym >= XKB_KEY_0 && keysym <= XKB_KEY_9)
+    return static_cast<ImGuiKey>(ImGuiKey_0 + (keysym - XKB_KEY_0));
+  if (keysym >= XKB_KEY_KP_0 && keysym <= XKB_KEY_KP_9)
+    return static_cast<ImGuiKey>(ImGuiKey_Keypad0 + (keysym - XKB_KEY_KP_0));
+  return ImGuiKey_None;
+}
+}  // namespace
+#endif
+
 bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
 {
   std::unique_lock<std::mutex> imgui_lock(m_imgui_mutex);
@@ -48,11 +166,16 @@ bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
     PanicAlertFmt("ImGui version check failed");
     return false;
   }
-  if (!ImGui::CreateContext())
+  // CreateContext() restores the previous current context when one exists
+  // (possibly the settings menu's), so capture the new context from its
+  // return value and select it explicitly before touching IO/style.
+  m_imgui_context = ImGui::CreateContext();
+  if (!m_imgui_context)
   {
     PanicAlertFmt("Creating ImGui context failed");
     return false;
   }
+  ImGui::SetCurrentContext(m_imgui_context);
   if (!ImPlot::CreateContext())
   {
     PanicAlertFmt("Creating ImPlot context failed");
@@ -113,9 +236,13 @@ OnScreenUI::~OnScreenUI()
 {
   std::unique_lock<std::mutex> imgui_lock(m_imgui_mutex);
 
+  // Another ImGui user (e.g. the settings menu) may have left its context
+  // current; EndFrame/DestroyContext must not run against that one.
+  ImGui::SetCurrentContext(m_imgui_context);
   ImGui::EndFrame();
   ImPlot::DestroyContext();
-  ImGui::DestroyContext();
+  ImGui::DestroyContext(m_imgui_context);
+  m_imgui_context = nullptr;
   m_imgui_textures.clear();
 }
 
@@ -193,6 +320,7 @@ void OnScreenUI::BeginImGuiFrame(u32 width, u32 height)
 
 void OnScreenUI::BeginImGuiFrameUnlocked(u32 width, u32 height)
 {
+  ImGui::SetCurrentContext(m_imgui_context);
   m_backbuffer_width = width;
   m_backbuffer_height = height;
 
@@ -212,6 +340,7 @@ void OnScreenUI::BeginImGuiFrameUnlocked(u32 width, u32 height)
 
 void OnScreenUI::DrawImGui()
 {
+  ImGui::SetCurrentContext(m_imgui_context);
   ImDrawData* draw_data = ImGui::GetDrawData();
   if (!draw_data)
     return;
@@ -417,12 +546,44 @@ void OnScreenUI::Finalize()
 {
   auto lock = GetImGuiLock();
 
+  ImGui::SetCurrentContext(m_imgui_context);
+
   auto& perf_metrics = Core::System::GetInstance().GetPerfMetrics();
   perf_metrics.DrawImGuiStats(m_backbuffer_scale);
   DrawDebugText();
   OSD::DrawMessages();
   DrawChallengesAndLeaderboards();
+  // Frontend overlay (the F1 settings menu) draws here: same context, same
+  // frame, inside the game window.
+  if (s_overlay_hook)
+    s_overlay_hook();
   ImGui::Render();
+
+  // MODERNGEKKO_IMGUI_DEBUG=1 reports the UI's present rate and vertex volume
+  // once a second. The settings overlay runs with the emulated core paused, so
+  // this is the only way to confirm from a log that the overlay is really being
+  // drawn at ~60 Hz instead of silently frozen.
+  if (const char* dbg = std::getenv("MODERNGEKKO_IMGUI_DEBUG"); dbg && *dbg == '1')
+  {
+    static auto last = std::chrono::steady_clock::now();
+    static unsigned presents = 0;
+    static unsigned min_vtx = ~0u;
+    static unsigned max_vtx = 0;
+    ++presents;
+    const unsigned vtx = static_cast<unsigned>(ImGui::GetDrawData()->TotalVtxCount);
+    min_vtx = std::min(min_vtx, vtx);
+    max_vtx = std::max(max_vtx, vtx);
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count() >= 1000)
+    {
+      std::fprintf(stderr, "[imgui] presents/s=%u vtx=%u..%u\n", presents, min_vtx, max_vtx);
+      std::fflush(stderr);
+      last = now;
+      presents = 0;
+      min_vtx = ~0u;
+      max_vtx = 0;
+    }
+  }
 
   // Check for font changes
   ImGuiStyle& style = ImGui::GetStyle();
@@ -555,6 +716,8 @@ void OnScreenUI::SetKeyMap(const DolphinKeyMap& key_map)
 
   auto lock = GetImGuiLock();
 
+  ImGui::SetCurrentContext(m_imgui_context);
+
   if (!ImGui::GetCurrentContext())
     return;
 
@@ -573,6 +736,7 @@ void OnScreenUI::SetKeyMap(const DolphinKeyMap& key_map)
 void OnScreenUI::SetKey(u32 key, bool is_down, const char* chars)
 {
   auto lock = GetImGuiLock();
+  ImGui::SetCurrentContext(m_imgui_context);
   if (auto iter = m_dolphin_to_imgui_map.find(key); iter != m_dolphin_to_imgui_map.end())
     ImGui::GetIO().AddKeyEvent((ImGuiKey)iter->second, is_down);
 
@@ -584,6 +748,8 @@ void OnScreenUI::SetMousePos(float x, float y)
 {
   auto lock = GetImGuiLock();
 
+  ImGui::SetCurrentContext(m_imgui_context);
+
   ImGui::GetIO().AddMousePosEvent(x, y);
 }
 
@@ -591,10 +757,41 @@ void OnScreenUI::SetMousePress(u32 button_mask)
 {
   auto lock = GetImGuiLock();
 
+  ImGui::SetCurrentContext(m_imgui_context);
+
   for (size_t i = 0; i < std::size(ImGui::GetIO().MouseDown); i++)
   {
     ImGui::GetIO().AddMouseButtonEvent(static_cast<int>(i), (button_mask & (1u << i)) != 0);
   }
+}
+
+void OnScreenUI::SetKeysym(u32 keysym, bool is_down)
+{
+#if defined(__linux__)
+  auto lock = GetImGuiLock();
+  if (!m_imgui_context)
+    return;
+
+  ImGui::SetCurrentContext(m_imgui_context);
+
+  const ImGuiKey imgui_key = KeysymToImGuiKey(keysym);
+  if (imgui_key != ImGuiKey_None)
+    ImGui::GetIO().AddKeyEvent(imgui_key, is_down);
+#else
+  (void)keysym;
+  (void)is_down;
+#endif
+}
+
+void OnScreenUI::SetMouseWheel(float x, float y)
+{
+  auto lock = GetImGuiLock();
+  if (!m_imgui_context)
+    return;
+
+  ImGui::SetCurrentContext(m_imgui_context);
+
+  ImGui::GetIO().AddMouseWheelEvent(x, y);
 }
 
 }  // namespace VideoCommon

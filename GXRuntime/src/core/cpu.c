@@ -69,6 +69,8 @@ void cpu_reset(CPUState* cpu) {
     PPCSPRRead spr_read = cpu->spr_read;
     PPCSPRWrite spr_write = cpu->spr_write;
     PPCCacheControl cache_control = cpu->cache_control;
+    u8* l1_cache = cpu->l1_cache;
+    u32 l1_cache_size = cpu->l1_cache_size;
 
     memset(cpu, 0, sizeof(*cpu));
     cpu->ram = ram;
@@ -125,6 +127,28 @@ bool ppc_fp_raise_unavailable(CPUState* cpu, u32 cia) {
 
 bool ppc_fp_available(CPUState* cpu, u32 cia) {
     return ppc_fp_available_inline(cpu, cia);
+}
+
+/* A pruned chunk switch only names the addresses the chassis can really
+   dispatch to. Computed branches (`ctx->pc = target`) can land anywhere, so a
+   target that no training run exercised has no `case`, and the entry switch
+   falls into its `default:` handler. Reporting each distinct one turns that
+   silent hole into a list the pruner can be fed; the handler then executes the
+   single instruction through the interpreter and the chassis re-dispatches at
+   pc+4, which is almost always a real entry, so the cost stays bounded. */
+#define PPC_ENTRY_MISS_SLOTS 512
+void ppc_entry_miss(u32 pc) {
+    static u32 seen[PPC_ENTRY_MISS_SLOTS];
+    static unsigned count;
+    unsigned i;
+    for (i = 0; i < count; ++i)
+        if (seen[i] == pc)
+            return;
+    if (count < PPC_ENTRY_MISS_SLOTS) {
+        seen[count++] = pc;
+        fprintf(stderr, "[entrymiss] pc=%08X n=%u\n", pc, count);
+        fflush(stderr);
+    }
 }
 
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia) {

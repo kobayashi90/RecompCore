@@ -18,6 +18,7 @@
 #include "Core/Config/ConfigManager.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/System.h"
+#include "VideoCommon/CommandProcessor.h"
 
 #ifdef _M_X86_64
 #include "Core/PowerPC/Jit64/Jit.h"
@@ -147,7 +148,14 @@ void StaticRecompCore::Init()
 {
   g_static_recomp_core = this;
   RefreshConfig();
+  m_ppc = &m_system.GetPPCState();
+  m_mmu = &m_system.GetMMU();
+  m_memory = &m_system.GetMemory();
+  m_gpfifo = &m_system.GetGPFifo();
+  m_cp = &m_system.GetCommandProcessor();
   m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
+  if (const char* const gate = std::getenv("STATICRECOMP_CACHEOP_GATE"))
+    m_skip_dataline_cacheops = std::strcmp(gate, "0") != 0;
   const char* fallback_override = std::getenv("STATICRECOMP_FALLBACK_RANGES");
   std::istringstream fallback_ranges(fallback_override ? fallback_override :
                                                          Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
@@ -181,7 +189,40 @@ void StaticRecompCore::Init()
   std::fprintf(stderr, "[staticrecomp] core init\n");
 
   LoadModule();
-  m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+  {
+    const u32 single = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+    if (single != 0)
+      m_idle_pcs.push_back(single);
+    const std::string list = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PCS);
+    std::size_t pos = 0;
+    while (pos < list.size())
+    {
+      std::size_t comma = list.find(',', pos);
+      if (comma == std::string::npos) comma = list.size();
+      std::string tok = list.substr(pos, comma - pos);
+      // trim
+      while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.erase(tok.begin());
+      while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.pop_back();
+      if (!tok.empty())
+      {
+        errno = 0;
+        char* endp = nullptr;
+        unsigned long v = std::strtoul(tok.c_str(), &endp, 0);
+        if (endp != tok.c_str() && *endp == '\0' && errno == 0)
+          m_idle_pcs.push_back(static_cast<u32>(v));
+      }
+      pos = comma + 1;
+    }
+  }
+  // Collapse duplicates, then build the fast-path bloom. Do this after parsing
+  // both the single-pc and the list setting so the hot loop never sees a
+  // partially populated set.
+  std::sort(m_idle_pcs.begin(), m_idle_pcs.end());
+  m_idle_pcs.erase(std::unique(m_idle_pcs.begin(), m_idle_pcs.end()), m_idle_pcs.end());
+  for (const u32 idle : m_idle_pcs)
+    m_idle_pc_bloom |= 1ull << ((idle >> 2) & 63);
+  m_idle_pc_cached = m_idle_pcs.empty() ? 0 : m_idle_pcs.front();
+
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
@@ -203,12 +244,49 @@ void StaticRecompCore::Shutdown()
   g_static_recomp_core = nullptr;
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu\n",
+               "fb_fast=%llu fb_slow=%llu smc_failed=%u verifications=%llu reverify_events=%llu "
+               "bursts=%llu cycles=%llu\n",
                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
                (unsigned long long)m_native_exceptions,
-               (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+               (unsigned long long)m_hook_fallback_instructions,
+               (unsigned long long)m_hook_fallback_fast,
+               (unsigned long long)m_hook_fallback_slow, m_failed_chunks,
                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
                (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
+  std::fprintf(stderr, "[staticrecomp] stalls: dispatches=%llu distinct_pcs=%zu\n",
+               (unsigned long long)m_stall_dispatches, m_stall_pcs.size());
+  {
+    std::vector<std::pair<u32, u64>> stalls(m_stall_pcs.begin(), m_stall_pcs.end());
+    std::sort(stalls.begin(), stalls.end(),
+              [](const auto& l, const auto& r) { return l.second > r.second; });
+    for (std::size_t i = 0; i < std::min<std::size_t>(stalls.size(), 16); ++i)
+      std::fprintf(stderr, "[staticrecomp] stall pc=%08x count=%llu\n", stalls[i].first,
+                   static_cast<unsigned long long>(stalls[i].second));
+  }
+  std::fprintf(stderr,
+               "[staticrecomp] hooks: ptr_calls=%llu l1=%llu ram=%llu null=%llu "
+               "mmio_gather=%llu mmio_other=%llu\n",               (unsigned long long)m_hook_ptr_calls, (unsigned long long)m_hook_ptr_l1,
+               (unsigned long long)m_hook_ptr_ram, (unsigned long long)m_hook_ptr_null,
+               (unsigned long long)m_hook_mmio_gather, (unsigned long long)m_hook_mmio_other);
+  std::fprintf(stderr,
+               "[staticrecomp] cacheops: probes=%llu skipped=%llu icbi=%llu "
+               "lines=%u gather_bursts=%llu\n",
+               (unsigned long long)m_cacheop_probes, (unsigned long long)m_cacheop_skipped,
+               (unsigned long long)m_cacheop_icbi, m_code_line_count,
+               static_cast<unsigned long long>(
+                   m_system.GetCommandProcessor().GetGatherPipeBurstCount()));
+  std::fprintf(stderr, "[staticrecomp] cpctrl: hex=%04x fifo_int_possible=%d\n",
+               m_system.GetCommandProcessor().GetCtrlHexSeen(),
+               static_cast<int>(m_system.GetCommandProcessor().FifoInterruptPossible()));
+  {
+    u32 hi_wm = 0, lo_wm = 0, hi_int = 0, lo_int = 0, size = 0, max_dist = 0, bp_int = 0;
+    m_system.GetCommandProcessor().GetFifoDiag(&hi_wm, &lo_wm, &hi_int, &lo_int, &size,
+                                               &max_dist, &bp_int);
+    std::fprintf(stderr,
+                 "[staticrecomp] fifo: size=%u hi_wm=%u lo_wm=%u hi_int=%u lo_int=%u "
+                 "bp_int=%u max_dist=%u\n",
+                 size, hi_wm, lo_wm, hi_int, lo_int, bp_int, max_dist);
+  }
   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
                                                     m_dispatch_samples.end());
   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
@@ -218,6 +296,16 @@ void StaticRecompCore::Shutdown()
     std::fprintf(stderr, "[staticrecomp] dispatch-site pc=%08x samples=%llu\n",
                  dispatch_samples[i].first,
                  static_cast<unsigned long long>(dispatch_samples[i].second));
+  }
+  std::vector<std::pair<u32, u64>> fallback_words(m_fallback_words.begin(),
+                                                  m_fallback_words.end());
+  std::sort(fallback_words.begin(), fallback_words.end(),
+            [](const auto& left, const auto& right) { return left.second > right.second; });
+  for (std::size_t i = 0; i < std::min<std::size_t>(fallback_words.size(), 16); ++i)
+  {
+    std::fprintf(stderr, "[staticrecomp] fallback-word raw=%08x count=%llu\n",
+                 fallback_words[i].first,
+                 static_cast<unsigned long long>(fallback_words[i].second));
   }
   NOTICE_LOG_FMT(POWERPC,
                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "

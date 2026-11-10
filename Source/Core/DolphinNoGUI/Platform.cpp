@@ -57,6 +57,11 @@ void Platform::Stop()
   m_running.Clear();
 }
 
+void Platform::RequestFullscreenChange(bool fullscreen)
+{
+  // No window, no fullscreen. Platforms that can do this override it.
+}
+
 void Platform::RequestShutdown()
 {
   m_shutdown_requested.Set();

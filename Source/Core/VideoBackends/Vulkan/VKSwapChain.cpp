@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include "Common/Assert.h"
 #include "Common/Contains.h"
@@ -268,13 +270,65 @@ bool SwapChain::SelectPresentMode()
                                                   &mode_count, present_modes.data());
   ASSERT(res == VK_SUCCESS);
 
-  // If vsync is enabled, use VK_PRESENT_MODE_FIFO_KHR.
-  // This check should not fail with conforming drivers, as the FIFO present mode is mandated by
-  // the specification (VK_KHR_swapchain). In case it isn't though, fall through to any other mode.
-  if (m_vsync_enabled && Common::Contains(present_modes, VK_PRESENT_MODE_FIFO_KHR))
+  // MODERNGEKKO_PRESENT_MODE=fifo|mailbox|immediate forces a present mode so the
+  // pacing strategies can be A/B tested without editing config or rebuilding.
+  // Diagnostics only: an unsupported or unknown request falls through to the
+  // normal selection below rather than failing to create the swap chain.
+  if (const char* forced = std::getenv("MODERNGEKKO_PRESENT_MODE"))
   {
-    m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
-    return true;
+    VkPresentModeKHR requested = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    if (std::strcmp(forced, "fifo") == 0)
+      requested = VK_PRESENT_MODE_FIFO_KHR;
+    else if (std::strcmp(forced, "mailbox") == 0)
+      requested = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (std::strcmp(forced, "immediate") == 0)
+      requested = VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+    if (requested == VK_PRESENT_MODE_MAX_ENUM_KHR)
+    {
+      WARN_LOG_FMT(VIDEO, "MODERNGEKKO_PRESENT_MODE='{}': expected fifo, mailbox or immediate",
+                   forced);
+    }
+    else if (Common::Contains(present_modes, requested))
+    {
+      m_present_mode = requested;
+      INFO_LOG_FMT(VIDEO, "Present mode forced to '{}' by MODERNGEKKO_PRESENT_MODE", forced);
+      return true;
+    }
+    else
+    {
+      WARN_LOG_FMT(VIDEO, "MODERNGEKKO_PRESENT_MODE='{}' not supported by this surface", forced);
+    }
+  }
+
+  // If vsync is enabled, prefer VK_PRESENT_MODE_MAILBOX_KHR over FIFO.
+  //
+  // MAILBOX still shows a new image only at vblank, so it does not tear, but it
+  // never stalls the submitting thread: a newer image replaces the queued one
+  // instead of the caller waiting for the compositor to consume it.
+  //
+  // FIFO blocks on the presentation engine, and under Wayland the compositor
+  // hands out one frame callback per refresh, so any client that presents more
+  // often than once per refresh is throttled to a fraction of real time. This
+  // emulator presents twice per guest frame (XFB copy + final present), which
+  // capped a 50 Hz title at 20 frames per second (speed 0.40) on a 60 Hz
+  // output even though the CPU and GPU were mostly idle. The emulation thread
+  // is paced by the frame limiter, so it must never wait on the compositor.
+  //
+  // FIFO remains the fallback: the specification (VK_KHR_swapchain) mandates
+  // it, so a conforming driver always has it.
+  if (m_vsync_enabled)
+  {
+    if (Common::Contains(present_modes, VK_PRESENT_MODE_MAILBOX_KHR))
+    {
+      m_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+      return true;
+    }
+    if (Common::Contains(present_modes, VK_PRESENT_MODE_FIFO_KHR))
+    {
+      m_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+      return true;
+    }
   }
 
   // Prefer screen-tearing, if possible, for lowest latency.
@@ -322,7 +376,21 @@ bool SwapChain::CreateSwapChain()
   // Determine the dimensions of the swap chain. Values of -1 indicate the size we specify here
   // determines window size?
   VkExtent2D size = surface_capabilities.currentExtent;
-  if (size.width == UINT32_MAX)
+  // On Wayland the surface extent is derived from the last attached buffer,
+  // which is stale by exactly one configure when a resize is in flight — and
+  // the presenter's backbuffer dims only update AFTER this recreation. The
+  // platform layer pushes the compositor-configured size through
+  // ResizeSurface(), so prefer it whenever one is pending.
+  int requested_width = 0;
+  int requested_height = 0;
+  if (g_presenter)
+    g_presenter->TakeRequestedSurfaceSize(requested_width, requested_height);
+  if (requested_width > 0 && requested_height > 0)
+  {
+    size.width = static_cast<uint32_t>(requested_width);
+    size.height = static_cast<uint32_t>(requested_height);
+  }
+  else if (size.width == UINT32_MAX)
   {
     // Wayland surfaces usually leave the extent to the client. The presenter
     // does not exist yet during the initial Vulkan swap-chain creation.
@@ -436,6 +504,8 @@ bool SwapChain::CreateSwapChain()
 bool SwapChain::SetupSwapChainImages()
 {
   ASSERT(m_swap_chain_images.empty());
+
+  std::fprintf(stderr, "[vk] setting up swapchain images %ux%u\n", m_width, m_height);
 
   uint32_t image_count;
   VkResult res =

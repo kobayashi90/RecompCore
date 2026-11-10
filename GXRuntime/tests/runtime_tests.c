@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 
-_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 4u,
+_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 5u,
                "update runtime ABI tests when the CPU ABI changes");
 _Static_assert(GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX == 1u,
                "GXRuntime generated-code prefix must stay explicit");
