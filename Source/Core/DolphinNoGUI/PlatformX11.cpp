@@ -63,6 +63,10 @@ private:
   int m_window_y = Config::Get(Config::MAIN_RENDER_WINDOW_YPOS);
   unsigned int m_window_width = Config::Get(Config::MAIN_RENDER_WINDOW_WIDTH);
   unsigned int m_window_height = Config::Get(Config::MAIN_RENDER_WINDOW_HEIGHT);
+  // Global button mask, exactly like the Wayland backend keeps one: the OSD
+  // ImGui menu needs press/release state, and a per-event toggle would release
+  // a held button on the next unrelated event.
+  unsigned int m_pointer_buttons = 0;
 };
 
 PlatformX11::~PlatformX11()
@@ -92,7 +96,12 @@ bool PlatformX11::Init()
 
   m_window = XCreateSimpleWindow(m_display, DefaultRootWindow(m_display), m_window_x, m_window_y,
                                  m_window_width, m_window_height, 0, 0, BlackPixel(m_display, 0));
-  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask);
+  // Button and motion events are what the F1 overlay needs: with only KeyPress
+  // selected the menu could be driven by the keyboard (tab switching worked)
+  // but the mouse never reached it, so every checkbox and button was dead.
+  XSelectInput(m_display, m_window,
+               StructureNotifyMask | KeyPressMask | FocusChangeMask | ButtonPressMask |
+                   ButtonReleaseMask | PointerMotionMask);
   // The Wayland backend names its toplevel from MODERNGEKKO_APP_ID so the
   // compositor can match the window to the launcher's .desktop file, and
   // therefore to its icon. X11 does the same job with WM_CLASS, which nothing
@@ -219,6 +228,54 @@ void PlatformX11::ProcessEvents()
     XNextEvent(m_display, &event);
     switch (event.type)
     {
+    case MotionNotify:
+    {
+      if (!g_presenter)
+        break;
+      // Window coordinates -> backbuffer pixels, the space the OSD ImGui
+      // context draws in (HiDPI: the two differ).
+      const float scale = g_presenter->GetBackbufferScale();
+      g_presenter->SetMousePos(static_cast<float>(event.xmotion.x) * scale,
+                               static_cast<float>(event.xmotion.y) * scale);
+      break;
+    }
+    case ButtonPress:
+    case ButtonRelease:
+    {
+      const bool pressed = event.type == ButtonPress;
+      unsigned int bit = 0;
+      switch (event.xbutton.button)
+      {
+      case Button1:
+        bit = 1u << 0;
+        break;
+      case Button3:
+        bit = 1u << 1;
+        break;
+      case Button2:
+        bit = 1u << 2;
+        break;
+      case Button4:
+      case Button5:
+        if (pressed && g_presenter)
+        {
+          const float direction = event.xbutton.button == Button4 ? 1.0f : -1.0f;
+          g_presenter->SetMouseWheel(0.0f, direction);
+        }
+        break;
+      default:
+        break;
+      }
+      if (bit == 0)
+        break;
+      if (pressed)
+        m_pointer_buttons |= bit;
+      else
+        m_pointer_buttons &= ~bit;
+      if (g_presenter)
+        g_presenter->SetMousePress(m_pointer_buttons);
+      break;
+    }
     case KeyPress:
       key = XLookupKeysym((XKeyEvent*)&event, 0);
       if (moderngekko::NotifyHotkey(static_cast<unsigned>(key)))
