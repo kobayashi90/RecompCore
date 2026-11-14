@@ -26,6 +26,12 @@
 #include <thread>
 
 #include "VideoCommon/Present.h"
+// The F1 settings menu claims its keys through the host hotkey hook, and the
+// OSD ImGui context only accepts XKB keysyms -- the same two headers the
+// Wayland/X11 platforms use. The keysym header is vendored (VideoCommon/)
+// because mingw-w64 ships no xkbcommon package.
+#include "VideoCommon/xkbcommon-keysyms.h"
+#include "moderngekko/hotkey.hpp"
 #include "resource.h"
 
 namespace
@@ -80,6 +86,10 @@ private:
   bool m_fullscreen = false;
   LONG m_windowed_style = 0;
   RECT m_windowed_rect{};
+  // Global button mask, exactly like the X11/Wayland backends keep one: the
+  // OSD ImGui menu needs press/release state, and a per-event toggle would
+  // release a held button on the next unrelated event.
+  unsigned int m_pointer_buttons = 0;
 
   int m_window_x = Config::Get(Config::MAIN_RENDER_WINDOW_XPOS);
   int m_window_y = Config::Get(Config::MAIN_RENDER_WINDOW_YPOS);
@@ -144,7 +154,10 @@ bool PlatformWin32::CreateMenus()
   if (!m_menu || !m_file_menu || !m_load_menu || !m_view_menu)
     return false;
 
-  AppendMenuW(m_file_menu, MF_STRING, ID_SAVE_STATE, L"&Save State\tF1");
+  // No F1 accelerator here: F1 opens the settings menu (claimed through the
+  // hotkey hook below), so advertising it as Save State would be a lie. The
+  // menu itself and the menu's States tab both still save.
+  AppendMenuW(m_file_menu, MF_STRING, ID_SAVE_STATE, L"&Save State");
   AppendMenuW(m_file_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(m_load_menu), L"&Load State");
   AppendMenuW(m_file_menu, MF_SEPARATOR, 0, nullptr);
   // Checked state is refreshed from the core when the menu opens, so it cannot
@@ -331,6 +344,124 @@ void PlatformWin32::ProcessEvents()
   }
 }
 
+// Native virtual key -> XKB keysym, the one currency the OSD ImGui context
+// accepts (OnScreenUI::SetKeysym) and the F1 menu's hotkey hook claims
+// (NotifyHotkey wants the same values on every host). Covers what the menu
+// navigates with: editing keys, arrows, F-keys, modifiers, the character keys
+// and the numpad. VK letter/digit codes are layout-logical, which is exactly
+// what XKB keysyms are; the OEM punctuation row is the US layout, harmless
+// because those keys only reach the menu as ImGui punctuation -- the menu has
+// no text input fields.
+unsigned KeysymFromVk(const WPARAM vk)
+{
+  if (vk >= VK_F1 && vk <= VK_F12)
+    return XKB_KEY_F1 + (vk - VK_F1);
+  if (vk >= 'A' && vk <= 'Z')
+    return XKB_KEY_a + (vk - 'A');
+  if (vk >= '0' && vk <= '9')
+    return XKB_KEY_0 + (vk - '0');
+  if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+    return XKB_KEY_KP_0 + (vk - VK_NUMPAD0);
+  switch (vk)
+  {
+  case VK_ESCAPE:
+    return XKB_KEY_Escape;
+  case VK_RETURN:
+    return XKB_KEY_Return;
+  case VK_TAB:
+    return XKB_KEY_Tab;
+  case VK_BACK:
+    return XKB_KEY_BackSpace;
+  case VK_DELETE:
+    return XKB_KEY_Delete;
+  case VK_INSERT:
+    return XKB_KEY_Insert;
+  case VK_HOME:
+    return XKB_KEY_Home;
+  case VK_END:
+    return XKB_KEY_End;
+  case VK_PRIOR:
+    return XKB_KEY_Page_Up;
+  case VK_NEXT:
+    return XKB_KEY_Page_Down;
+  case VK_LEFT:
+    return XKB_KEY_Left;
+  case VK_UP:
+    return XKB_KEY_Up;
+  case VK_RIGHT:
+    return XKB_KEY_Right;
+  case VK_DOWN:
+    return XKB_KEY_Down;
+  case VK_SPACE:
+    return XKB_KEY_space;
+  case VK_SHIFT:
+    return XKB_KEY_Shift_L;
+  case VK_RSHIFT:
+    return XKB_KEY_Shift_R;
+  case VK_CONTROL:
+    return XKB_KEY_Control_L;
+  case VK_RCONTROL:
+    return XKB_KEY_Control_R;
+  case VK_MENU:
+    return XKB_KEY_Alt_L;
+  case VK_RMENU:
+    return XKB_KEY_Alt_R;
+  case VK_LWIN:
+    return XKB_KEY_Super_L;
+  case VK_RWIN:
+    return XKB_KEY_Super_R;
+  case VK_CAPITAL:
+    return XKB_KEY_Caps_Lock;
+  case VK_NUMLOCK:
+    return XKB_KEY_Num_Lock;
+  case VK_SNAPSHOT:
+    return XKB_KEY_Print;
+  case VK_PAUSE:
+    return XKB_KEY_Pause;
+  case VK_ADD:
+    return XKB_KEY_KP_Add;
+  case VK_SUBTRACT:
+    return XKB_KEY_KP_Subtract;
+  case VK_MULTIPLY:
+    return XKB_KEY_KP_Multiply;
+  case VK_DIVIDE:
+    return XKB_KEY_KP_Divide;
+  case VK_DECIMAL:
+    return XKB_KEY_KP_Decimal;
+  case VK_OEM_MINUS:
+    return XKB_KEY_minus;
+  case VK_OEM_PLUS:
+    return XKB_KEY_equal;
+  case VK_OEM_1:
+    return XKB_KEY_semicolon;
+  case VK_OEM_2:
+    return XKB_KEY_slash;
+  case VK_OEM_3:
+    return XKB_KEY_grave;
+  case VK_OEM_4:
+    return XKB_KEY_bracketleft;
+  case VK_OEM_5:
+    return XKB_KEY_backslash;
+  case VK_OEM_6:
+    return XKB_KEY_bracketright;
+  case VK_OEM_7:
+    return XKB_KEY_apostrophe;
+  default:
+    return 0;
+  }
+}
+
+// Feeds one key transition into the OSD ImGui context (the F1 settings menu
+// draws inside the game window through it). Returns the keysym so the caller
+// can run the host hotkey hook on it as well.
+unsigned FeedKeyToPresenter(const WPARAM vk, const bool down)
+{
+  const unsigned keysym = KeysymFromVk(vk);
+  if (keysym && g_presenter)
+    g_presenter->SetKeysym(keysym, down);
+  return keysym;
+}
+
 LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wParam,
                                const LPARAM lParam)
 {
@@ -364,55 +495,210 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
   break;
 
   case WM_KEYDOWN:
-    // Bit 30 of lParam is the previous key state: ignore auto-repeat, or holding
-    // F1 down would write a state every few milliseconds.
-    if (wParam == VK_F1 && (static_cast<ULONG_PTR>(lParam) & (1u << 30)) == 0)
+  case WM_SYSKEYDOWN:
+  {
+    const bool repeat = (static_cast<ULONG_PTR>(lParam) & (1u << 30)) != 0;
+    // Feed the OSD ImGui context first, exactly like the Wayland backend:
+    // the F1 settings menu draws inside the game window through it, and it
+    // needs both presses and (from WM_KEYUP/WM_SYSKEYUP) releases.
+    const unsigned keysym = FeedKeyToPresenter(wParam, true);
+    // The menu gets first refusal on keys like F1 so it can claim them before
+    // the platform's own hotkeys below. Never on auto-repeat: holding F1 down
+    // would otherwise toggle the menu every few milliseconds.
+    if (keysym && !repeat && moderngekko::NotifyHotkey(keysym))
+      return 0;
+    // Auto-repeat must not re-run the platform hotkeys either: holding ESC
+    // in fullscreen would flip it on and off, and with the menu just closed
+    // by the first press it would quit the game. A repeated system key (held
+    // F10, held Alt) still goes to DefWindowProc as Windows expects.
+    if (repeat)
     {
+      if (msg == WM_SYSKEYDOWN)
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+      break;
+    }
+    // Alt combos belong to Windows (Alt+F4 closes, Alt+Space opens the system
+    // menu, Alt+F1..F12 do nothing) -- without this the F2..F8 state slots
+    // would swallow Alt+F4 as "load slot 4". Alt+Enter is the one exception,
+    // and it arrives as a system key precisely because Alt is held.
+    if (msg == WM_SYSKEYDOWN && (GetKeyState(VK_MENU) & 0x8000) != 0)
+    {
+      if (wParam == VK_RETURN)
+      {
+        platform->ToggleFullscreen();
+        return 0;
+      }
+      return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    switch (wParam)
+    {
+    case VK_F1:
+      // Fallback only: with the settings menu registered (which it always is
+      // in the runner) F1 is claimed above, and the File menu / States tab
+      // cover saving. Kept for a future platform without the menu.
       platform->SaveStateToStatesDirectory();
       return 0;
-    }
-    else if (wParam == VK_SPACE)
+    case VK_F2:
+    case VK_F3:
+    case VK_F4:
+    case VK_F5:
+    case VK_F6:
+    case VK_F7:
+    case VK_F8:
     {
+      // Same slots as the X11/Wayland backends: F2..F8 load slots 2..8,
+      // Shift+F2..F8 save. (F1 itself is the menu on both, so slot 1 is
+      // reached through the menu's States tab.)
+      const int slot = static_cast<int>(wParam - VK_F2) + 2;
+      auto& system = Core::System::GetInstance();
+      if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+        State::Save(system, slot);
+      else
+        State::Load(system, slot);
+      return 0;
+    }
+    case VK_F9:
+      Core::SaveScreenShot();
+      return 0;
+    case VK_F10:
+    {
+      // Windows generates WM_SYSKEYDOWN for F10 (it is the menu-bar key), so
+      // this case has to live in the shared switch below the system-message
+      // branch -- pause, as on X11/Wayland, instead of DefWindowProc beeping
+      // at the menu bar.
+      auto& system = Core::System::GetInstance();
+      const bool running = Core::GetState(system) == Core::State::Running;
+      Core::SetState(system, running ? Core::State::Paused : Core::State::Running);
+      return 0;
+    }
+    case VK_F11:
+      // Deliberately fullscreen, not "load last saved" as on X11/Wayland:
+      // F11 has always been the Windows fullscreen key here, and Alt+Enter
+      // works on both platforms anyway.
+      platform->ToggleFullscreen();
+      return 0;
+    case VK_F12:
+    {
+      auto& system = Core::System::GetInstance();
+      if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+        State::UndoLoadState(system);
+      else
+        State::UndoSaveState(system);
+      return 0;
+    }
+    case VK_SPACE:
       Config::SetCurrent(Config::MAIN_EMULATION_SPEED, FAST_FORWARD_SPEED);
       return 0;
-    }
-    else if (wParam == VK_F11)
-    {
-      platform->ToggleFullscreen();
+    case VK_ESCAPE:
+      // Plain ESC closes the fullscreen window first, then quits -- but only
+      // while no menu is open: the settings menu claims ESC when visible
+      // (ConfigMenu::HotkeyThunk) so closing it cannot also quit the game.
+      if (platform->m_fullscreen)
+        platform->ToggleFullscreen();
+      else
+        platform->RequestShutdown();
       return 0;
+    default:
+      break;
     }
-    else if (wParam == VK_ESCAPE && platform->m_fullscreen)
-    {
-      platform->ToggleFullscreen();
-      return 0;
-    }
-    else if (wParam == VK_ESCAPE)
-    {
-      platform->RequestShutdown();
-    }
+    // Anything else that came in as a system message (Alt+letter and friends)
+    // keeps its default Windows behaviour.
+    if (msg == WM_SYSKEYDOWN)
+      return DefWindowProc(hwnd, msg, wParam, lParam);
     break;
+  }
 
   case WM_KEYUP:
-    if (wParam == VK_SPACE)
+  case WM_SYSKEYUP:
+  {
+    // Releases must reach the menu too, or a key it saw go down stays stuck
+    // down inside ImGui after the menu closes.
+    FeedKeyToPresenter(wParam, false);
+    if (msg == WM_KEYUP)
     {
-      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
-      return 0;
+      if (wParam == VK_SPACE)
+      {
+        Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
+        return 0;
+      }
+      break;
     }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+  }
+
+  case WM_MOUSEMOVE:
+  {
+    if (!g_presenter)
+      break;
+    // Window coordinates -> backbuffer pixels, the space the OSD ImGui
+    // context draws in (HiDPI: the two differ), as on X11/Wayland.
+    const float scale = g_presenter->GetBackbufferScale();
+    g_presenter->SetMousePos(static_cast<float>(static_cast<short>(LOWORD(lParam))) * scale,
+                             static_cast<float>(static_cast<short>(HIWORD(lParam))) * scale);
     break;
+  }
+
+  case WM_LBUTTONDOWN:
+  case WM_LBUTTONUP:
+  case WM_RBUTTONDOWN:
+  case WM_RBUTTONUP:
+  case WM_MBUTTONDOWN:
+  case WM_MBUTTONUP:
+  {
+    if (!platform || !g_presenter)
+      break;
+    // Same bits as the X11/Wayland backends: left 1<<0, right 1<<1, middle 1<<2.
+    unsigned int bit = 0;
+    switch (msg)
+    {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+      bit = 1u << 0;
+      break;
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+      bit = 1u << 1;
+      break;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+      bit = 1u << 2;
+      break;
+    default:
+      break;
+    }
+    // Clicks carry client coordinates as well: a click without a prior move
+    // (remote desktop, warping) would otherwise land on a stale position.
+    const float scale = g_presenter->GetBackbufferScale();
+    g_presenter->SetMousePos(static_cast<float>(static_cast<short>(LOWORD(lParam))) * scale,
+                             static_cast<float>(static_cast<short>(HIWORD(lParam))) * scale);
+    const bool down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+    if (down)
+      platform->m_pointer_buttons |= bit;
+    else
+      platform->m_pointer_buttons &= ~bit;
+    g_presenter->SetMousePress(platform->m_pointer_buttons);
+    break;
+  }
+
+  case WM_MOUSEWHEEL:
+  {
+    if (!g_presenter)
+      break;
+    // One notch = +/-1.0 like X11's Button4/Button5; Windows reports the
+    // distance in WHEEL_DELTA units, positive = scrolled forward (up).
+    const float wheel =
+        static_cast<float>(static_cast<short>(HIWORD(wParam))) / static_cast<float>(WHEEL_DELTA);
+    if (wheel != 0.0f)
+      g_presenter->SetMouseWheel(0.0f, wheel);
+    break;
+  }
 
   case WM_KILLFOCUS:
     // Never leave emulation running fast because Space was released while
     // another window had focus and the key-up went elsewhere.
     Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
     break;
-
-  case WM_SYSKEYDOWN:
-    if (wParam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000) != 0)
-    {
-      platform->ToggleFullscreen();
-      return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
 
   case WM_INITMENUPOPUP:
     if (platform)

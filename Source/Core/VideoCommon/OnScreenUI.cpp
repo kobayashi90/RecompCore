@@ -41,9 +41,10 @@
 #include <imgui.h>
 #include <implot.h>
 
-#if defined(__linux__)
-#include <xkbcommon/xkbcommon-keysyms.h>
-#endif
+// The keysym header is vendored next to this file (it is the Open Group
+// keysym list, unmodified): mingw-w64 ships no xkbcommon package, and the
+// Windows/X11/Wayland backends all speak XKB keysyms to this OSD context.
+#include "xkbcommon-keysyms.h"
 
 namespace VideoCommon
 {
@@ -56,7 +57,6 @@ void OnScreenUI::SetOverlayDrawHook(std::function<void()> hook)
   s_overlay_hook = std::move(hook);
 }
 
-#if defined(__linux__)
 namespace
 {
 ImGuiKey KeysymToImGuiKey(u32 keysym)
@@ -155,7 +155,6 @@ ImGuiKey KeysymToImGuiKey(u32 keysym)
   return ImGuiKey_None;
 }
 }  // namespace
-#endif
 
 bool OnScreenUI::Initialize(u32 width, u32 height, float scale)
 {
@@ -767,7 +766,6 @@ void OnScreenUI::SetMousePress(u32 button_mask)
 
 void OnScreenUI::SetKeysym(u32 keysym, bool is_down)
 {
-#if defined(__linux__)
   auto lock = GetImGuiLock();
   if (!m_imgui_context)
     return;
@@ -777,10 +775,6 @@ void OnScreenUI::SetKeysym(u32 keysym, bool is_down)
   const ImGuiKey imgui_key = KeysymToImGuiKey(keysym);
   if (imgui_key != ImGuiKey_None)
     ImGui::GetIO().AddKeyEvent(imgui_key, is_down);
-#else
-  (void)keysym;
-  (void)is_down;
-#endif
 }
 
 void OnScreenUI::SetMouseWheel(float x, float y)
