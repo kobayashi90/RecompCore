@@ -106,6 +106,11 @@ void Timer::IncreaseResolution()
   // This is best-effort (i.e. the call may fail on older versions of Windows, where such throttling
   // doesn't exist, anyway), and we don't bother reverting once set.
   // This adjusts behavior on CPUs with "performance" and "efficiency" cores
+  // PROCESS_POWER_THROTTLING_STATE / ProcessPowerThrottling live in the Windows
+  // 10 SDK, which mingw-w64 does not ship (SetProcessInformation is absent from
+  // its headers entirely). This is best-effort anyway -- on a build without the
+  // SDK the timer resolution below still applies, only the ecoQoS hint is lost.
+#if defined(_MSC_VER) || (defined(PROCESS_POWER_THROTTLING_CURRENT_VERSION) && defined(ProcessPowerThrottling))
   PROCESS_POWER_THROTTLING_STATE PowerThrottling{};
   PowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
   PowerThrottling.ControlMask =
@@ -113,6 +118,7 @@ void Timer::IncreaseResolution()
   PowerThrottling.StateMask = 0;
   SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &PowerThrottling,
                         sizeof(PowerThrottling));
+#endif
 
   // Not actually sure how useful this is these days.. :')
   timeBeginPeriod(TIMER_RESOLUTION_MS);
