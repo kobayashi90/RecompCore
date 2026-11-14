@@ -60,7 +60,14 @@ const Info<bool> MAIN_SMOOTH_EARLY_PRESENTATION{{System::Main, "Core", "SmoothEa
 // Currently enabled by default on Android because the performance boost is really needed.
 constexpr bool DEFAULT_CPU_THREAD = true;
 #else
-constexpr bool DEFAULT_CPU_THREAD = false;
+// Dual-core by default everywhere else too: single-CPU mode is documented to
+// saturate a core at ~102% and runs at roughly 0.59-0.81x full speed (see
+// PERFORMANCE.md), while dual-core reaches ~1.00x. This ships as the compiled
+// default rather than a game ini because the port boots main.dol directly, so
+// Dolphin's game id becomes "ID-main" and no GBS*.ini config layer is ever
+// loaded (only the Cheats tab builds those paths by hand). A user's
+// Dolphin.ini still overrides it either way.
+constexpr bool DEFAULT_CPU_THREAD = true;
 #endif
 const Info<bool> MAIN_CPU_THREAD{{System::Main, "Core", "CPUThread"}, DEFAULT_CPU_THREAD};
 const Info<bool> MAIN_LOAD_GAME_INTO_MEMORY{{System::Main, "Core", "LoadGameIntoMemory"}, false};
